@@ -1,0 +1,11 @@
+[Unit]
+Description=mineback vault maintenance — scrub, gc, prune (dry-run)
+
+[Service]
+Type=oneshot
+# `prune` is intentionally run WITHOUT --yes here: this unit reports what
+# pruning would do (L4) and leaves actually deleting anything to a human
+# running `mineback vault prune --yes`, or to a second, explicitly-opted-in
+# timer if you decide nightly auto-prune is what you want.
+ExecStart=/usr/local/bin/mineback vault verify --gc
+ExecStart=/usr/local/bin/mineback vault prune

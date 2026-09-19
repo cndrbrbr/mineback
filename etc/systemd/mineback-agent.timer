@@ -1,0 +1,13 @@
+[Unit]
+Description=Run mineback fleet snapshot nightly
+
+[Timer]
+# 02:15 local time — after most workshop activity, before students' next
+# session. RandomizedDelaySec staggers multiple hosts hitting one vault at
+# once if you copy this file to more than one host.
+OnCalendar=*-*-* 02:15:00
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target

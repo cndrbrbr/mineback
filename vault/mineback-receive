@@ -1,0 +1,252 @@
+#!/bin/bash
+# mineback-receive — append-only artifact receiver for the mineback vault.
+#
+# This is the program named in the agent's SSH forced command
+# (authorized_keys: command="mineback-receive --fixed-host kag-01",no-pty,...).
+# It also runs unmodified when invoked directly on the same host (transport
+# "local" in agent.env) — same argv, same stdin, same protocol either way.
+#
+# Verbs (see ARCHITECTURE.md §7 for the sequence this implements):
+#
+#   put             <host> <server> <snapshot> <artifact>
+#       stdin: raw artifact bytes. Writes incoming/<host>/<server>/<snapshot>/<artifact>.tmp
+#       while hashing it. Prints "OK <sha256> <bytes>" (or "ERR <msg>").
+#
+#   confirm         <host> <server> <snapshot> <artifact> <sha256>
+#       Re-hashes the incoming .tmp file, checks it matches <sha256>, and moves
+#       it into store/<host>/servers/<server>/<snapshot>/<artifact>. Refuses if
+#       the destination already exists (append-only: no overwrite).
+#
+#   commit-manifest <host> <server> <snapshot>
+#       stdin: manifest.json content. Writes it into the snapshot dir and,
+#       last of all, touches .complete — the file whose presence is the only
+#       thing that makes a snapshot visible to the catalog. Refuses if the
+#       snapshot is already committed.
+#
+#   put-fleet / confirm-fleet / commit-fleet-manifest
+#       Same three-step protocol, for fleet-level artifacts (hostconf.zip,
+#       hostconf-secrets.age), stored under store/<host>/fleets/<snapshot>/.
+#
+# Every verb validates every identifier against a strict allowlist regex
+# before touching the filesystem (S7) and, when --fixed-host is given
+# (or MINEBACK_FIXED_HOST is set — the SSH-environment equivalent), refuses
+# any <host> that doesn't match it (S3: a host can only write its own name).
+
+set -u
+umask 077
+
+MINEBACK_HOME="${MINEBACK_HOME:-/var/lib/mineback}"
+INCOMING="$MINEBACK_HOME/incoming"
+STORE="$MINEBACK_HOME/store"
+LOGDIR="$MINEBACK_HOME/logs"
+MINEBACK_CLI="${MINEBACK_CLI:-mineback}"
+FIXED_HOST=""
+
+log() {
+    mkdir -p "$LOGDIR" 2>/dev/null
+    printf '%s\tpid=%s\t%s\n' "$(date -u +%FT%TZ)" "$$" "$*" >> "$LOGDIR/receive.log" 2>/dev/null
+}
+
+fail() {
+    echo "ERR $*"
+    log "ERROR: $*"
+    exit 1
+}
+
+# ── argument parsing: optional --fixed-host, then the verb ───────────────
+if [ "${1:-}" = "--fixed-host" ]; then
+    FIXED_HOST="$2"
+    shift 2
+fi
+FIXED_HOST="${FIXED_HOST:-${MINEBACK_FIXED_HOST:-}}"
+
+VERB="${1:-}"
+shift || true
+
+# ── name validation (S7) ──────────────────────────────────────────────────
+ID_RE='^[A-Za-z0-9_-]{1,64}$'
+SNAP_RE='^[0-9]{8}T[0-9]{6}Z$'
+SERVER_ARTIFACTS_RE='^(cfg|plugins|worlds|state)\.zip$|^secrets\.age$'
+FLEET_ARTIFACTS_RE='^hostconf\.zip$|^hostconf-secrets\.age$'
+
+valid_id()       { [[ "$1" =~ $ID_RE ]]; }
+valid_snapshot() { [[ "$1" =~ $SNAP_RE ]]; }
+valid_server_artifact() { [[ "$1" =~ $SERVER_ARTIFACTS_RE ]]; }
+valid_fleet_artifact()  { [[ "$1" =~ $FLEET_ARTIFACTS_RE ]]; }
+
+check_host() {
+    valid_id "$1" || fail "invalid host id '$1'"
+    if [ -n "$FIXED_HOST" ] && [ "$1" != "$FIXED_HOST" ]; then
+        fail "host '$1' does not match this key's fixed host '$FIXED_HOST'"
+    fi
+}
+
+sha256_of() { sha256sum "$1" | awk '{print $1}'; }
+
+usage() {
+    cat >&2 <<'EOF'
+Usage: mineback-receive [--fixed-host HOST] <verb> [args...]
+  put             <host> <server> <snapshot> <artifact>   (stdin: bytes)
+  confirm         <host> <server> <snapshot> <artifact> <sha256>
+  commit-manifest <host> <server> <snapshot>               (stdin: manifest.json)
+  put-fleet             <host> <snapshot> <artifact>        (stdin: bytes)
+  confirm-fleet         <host> <snapshot> <artifact> <sha256>
+  commit-fleet-manifest <host> <snapshot>                   (stdin: manifest.json)
+EOF
+    exit 2
+}
+
+# ── server-snapshot verbs ─────────────────────────────────────────────────
+
+cmd_put() {
+    local host="$1" server="$2" snap="$3" art="$4"
+    check_host "$host"
+    valid_id "$server"       || fail "invalid server name '$server'"
+    valid_snapshot "$snap"   || fail "invalid snapshot id '$snap'"
+    valid_server_artifact "$art" || fail "invalid artifact name '$art'"
+
+    local dir="$INCOMING/$host/servers/$server/$snap"
+    mkdir -p "$dir" || fail "cannot create incoming dir"
+    local tmp="$dir/$art.tmp"
+
+    cat > "$tmp" || fail "write failed"
+    local bytes hash
+    bytes=$(stat -c%s "$tmp" 2>/dev/null || stat -f%z "$tmp")
+    hash=$(sha256_of "$tmp")
+    log "put host=$host server=$server snap=$snap art=$art bytes=$bytes sha256=$hash"
+    echo "OK $hash $bytes"
+}
+
+cmd_confirm() {
+    local host="$1" server="$2" snap="$3" art="$4" expect="$5"
+    check_host "$host"
+    valid_id "$server"       || fail "invalid server name '$server'"
+    valid_snapshot "$snap"   || fail "invalid snapshot id '$snap'"
+    valid_server_artifact "$art" || fail "invalid artifact name '$art'"
+
+    local tmp="$INCOMING/$host/servers/$server/$snap/$art.tmp"
+    [ -f "$tmp" ] || fail "no such incoming artifact (call put first)"
+    local actual
+    actual=$(sha256_of "$tmp")
+    [ "$actual" = "$expect" ] || fail "checksum mismatch: expected $expect got $actual"
+
+    local destdir="$STORE/$host/servers/$server/$snap"
+    local dest="$destdir/$art"
+    if [ -e "$dest" ]; then
+        fail "artifact already exists (append-only): $dest"
+    fi
+    mkdir -p "$destdir" || fail "cannot create store dir"
+    mv -n "$tmp" "$dest" || fail "move failed"
+    sync "$dest" 2>/dev/null || true
+    log "confirm host=$host server=$server snap=$snap art=$art sha256=$actual -> $dest"
+    echo "OK"
+}
+
+cmd_commit_manifest() {
+    local host="$1" server="$2" snap="$3"
+    check_host "$host"
+    valid_id "$server"     || fail "invalid server name '$server'"
+    valid_snapshot "$snap" || fail "invalid snapshot id '$snap'"
+
+    local destdir="$STORE/$host/servers/$server/$snap"
+    [ -d "$destdir" ] || fail "no such snapshot dir (no artifacts confirmed yet)"
+    if [ -f "$destdir/.complete" ]; then
+        fail "snapshot already committed (append-only): $destdir"
+    fi
+    cat > "$destdir/manifest.json.tmp" || fail "write failed"
+    mv -n "$destdir/manifest.json.tmp" "$destdir/manifest.json" || fail "manifest move failed"
+    date -u +%FT%TZ > "$destdir/.complete"
+    sync "$destdir/.complete" 2>/dev/null || true
+    log "commit-manifest host=$host server=$server snap=$snap -> COMPLETE"
+    echo "OK"
+
+    # Best-effort catalog/compat-view refresh. A failure here is reported but
+    # does not unwind the commit — the snapshot is already durable and safe;
+    # `mineback vault reindex` / `vault publish` can always be re-run.
+    if command -v "$MINEBACK_CLI" >/dev/null 2>&1; then
+        "$MINEBACK_CLI" vault publish "$host/$server/$snap" >>"$LOGDIR/receive.log" 2>&1 \
+            || log "WARN: vault publish failed for $host/$server/$snap"
+        "$MINEBACK_CLI" vault reindex --quiet >>"$LOGDIR/receive.log" 2>&1 \
+            || log "WARN: vault reindex failed after $host/$server/$snap"
+    fi
+}
+
+# ── fleet-snapshot verbs (host-level config, no server name) ─────────────
+
+cmd_put_fleet() {
+    local host="$1" snap="$2" art="$3"
+    check_host "$host"
+    valid_snapshot "$snap" || fail "invalid snapshot id '$snap'"
+    valid_fleet_artifact "$art" || fail "invalid fleet artifact name '$art'"
+
+    local dir="$INCOMING/$host/fleets/$snap"
+    mkdir -p "$dir" || fail "cannot create incoming dir"
+    local tmp="$dir/$art.tmp"
+    cat > "$tmp" || fail "write failed"
+    local bytes hash
+    bytes=$(stat -c%s "$tmp" 2>/dev/null || stat -f%z "$tmp")
+    hash=$(sha256_of "$tmp")
+    log "put-fleet host=$host snap=$snap art=$art bytes=$bytes sha256=$hash"
+    echo "OK $hash $bytes"
+}
+
+cmd_confirm_fleet() {
+    local host="$1" snap="$2" art="$3" expect="$4"
+    check_host "$host"
+    valid_snapshot "$snap" || fail "invalid snapshot id '$snap'"
+    valid_fleet_artifact "$art" || fail "invalid fleet artifact name '$art'"
+
+    local tmp="$INCOMING/$host/fleets/$snap/$art.tmp"
+    [ -f "$tmp" ] || fail "no such incoming artifact (call put-fleet first)"
+    local actual
+    actual=$(sha256_of "$tmp")
+    [ "$actual" = "$expect" ] || fail "checksum mismatch: expected $expect got $actual"
+
+    local destdir="$STORE/$host/fleets/$snap"
+    local dest="$destdir/$art"
+    if [ -e "$dest" ]; then
+        fail "artifact already exists (append-only): $dest"
+    fi
+    mkdir -p "$destdir" || fail "cannot create store dir"
+    mv -n "$tmp" "$dest" || fail "move failed"
+    sync "$dest" 2>/dev/null || true
+    log "confirm-fleet host=$host snap=$snap art=$art sha256=$actual -> $dest"
+    echo "OK"
+}
+
+cmd_commit_fleet_manifest() {
+    local host="$1" snap="$2"
+    check_host "$host"
+    valid_snapshot "$snap" || fail "invalid snapshot id '$snap'"
+
+    # A fleet snapshot with zero host-level artifacts is legitimate (hostconf
+    # capture can be entirely unconfigured/skipped while every server still
+    # snapshotted fine) — so unlike the server-snapshot commit, this does not
+    # require the directory to already exist from a prior artifact.
+    local destdir="$STORE/$host/fleets/$snap"
+    mkdir -p "$destdir" || fail "cannot create fleet snapshot dir"
+    if [ -f "$destdir/.complete" ]; then
+        fail "fleet snapshot already committed (append-only): $destdir"
+    fi
+    cat > "$destdir/manifest.json.tmp" || fail "write failed"
+    mv -n "$destdir/manifest.json.tmp" "$destdir/manifest.json" || fail "manifest move failed"
+    date -u +%FT%TZ > "$destdir/.complete"
+    sync "$destdir/.complete" 2>/dev/null || true
+    log "commit-fleet-manifest host=$host snap=$snap -> COMPLETE"
+    echo "OK"
+
+    if command -v "$MINEBACK_CLI" >/dev/null 2>&1; then
+        "$MINEBACK_CLI" vault reindex --quiet >>"$LOGDIR/receive.log" 2>&1 \
+            || log "WARN: vault reindex failed after fleet $host/$snap"
+    fi
+}
+
+case "$VERB" in
+    put)                    [ $# -eq 4 ] || usage; cmd_put "$@" ;;
+    confirm)                [ $# -eq 5 ] || usage; cmd_confirm "$@" ;;
+    commit-manifest)        [ $# -eq 3 ] || usage; cmd_commit_manifest "$@" ;;
+    put-fleet)              [ $# -eq 3 ] || usage; cmd_put_fleet "$@" ;;
+    confirm-fleet)          [ $# -eq 4 ] || usage; cmd_confirm_fleet "$@" ;;
+    commit-fleet-manifest)  [ $# -eq 2 ] || usage; cmd_commit_fleet_manifest "$@" ;;
+    *) usage ;;
+esac

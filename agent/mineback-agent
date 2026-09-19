@@ -1,0 +1,639 @@
+#!/bin/bash
+# mineback-agent — snapshots MHS servers and pushes them to the mineback vault.
+#
+# Runs on a hosting host. Depends on nothing beyond what an MHS host already
+# has: bash, docker, ssh, zip, curl — plus the `age` binary to encrypt
+# secrets. See ARCHITECTURE.md §3 and §7.
+#
+# Usage:
+#   mineback-agent selftest
+#   mineback-agent snapshot [server...] [--fleet] [--cold] [--reason TEXT]
+#                           [--parts cfg,plugins,worlds,state,secrets]
+#                           [--dry-run]
+#
+# Configuration is read from $MINEBACK_AGENT_CONF (default
+# /etc/mineback/agent.env), a plain `KEY=value` shell-sourced file.
+# See etc/agent.env.example for every variable this script reads:
+#   MINEBACK_HOST_ID, MINEBACK_VAULT, MINEBACK_VAULT_SSH_KEY,
+#   MINEBACK_RECIPIENTS_FILE, MINEBACK_SERVERS, MINEBACK_PROXY,
+#   MINEBACK_MHS_DIR, MINEBACK_FLUSH_TIMEOUT, MINEBACK_SPOOL_DIR
+
+set -u
+umask 077
+
+# ── configuration ──────────────────────────────────────────────────────
+MINEBACK_AGENT_CONF="${MINEBACK_AGENT_CONF:-/etc/mineback/agent.env}"
+if [ -f "$MINEBACK_AGENT_CONF" ]; then
+    # shellcheck disable=SC1090
+    source "$MINEBACK_AGENT_CONF"
+fi
+
+MINEBACK_HOST_ID="${MINEBACK_HOST_ID:-}"
+MINEBACK_VAULT="${MINEBACK_VAULT:-}"                 # "local" or "ssh://user@host[:port]"
+MINEBACK_VAULT_SSH_KEY="${MINEBACK_VAULT_SSH_KEY:-}"
+MINEBACK_RECEIVE_BIN="${MINEBACK_RECEIVE_BIN:-mineback-receive}"   # used when transport=local
+MINEBACK_RECIPIENTS_FILE="${MINEBACK_RECIPIENTS_FILE:-}"
+MINEBACK_SERVERS="${MINEBACK_SERVERS:-mc1 mc2 mc3 mc4 mc5}"
+MINEBACK_LOBBY="${MINEBACK_LOBBY:-lobby}"
+MINEBACK_PROXY="${MINEBACK_PROXY:-bungee}"
+MINEBACK_MHS_DIR="${MINEBACK_MHS_DIR:-}"
+MINEBACK_FLUSH_TIMEOUT="${MINEBACK_FLUSH_TIMEOUT:-60}"
+MINEBACK_STOP_TIMEOUT="${MINEBACK_STOP_TIMEOUT:-30}"
+MINEBACK_STARTUP_TIMEOUT="${MINEBACK_STARTUP_TIMEOUT:-180}"
+MINEBACK_LOG="${MINEBACK_LOG:-/var/log/mineback-agent.log}"
+
+ALL_PARTS="cfg plugins worlds state secrets"
+EXIT_CODE=0
+
+log() {
+    # stderr, not stdout: many functions below (snapshot_server, send_artifact,
+    # pack_part_spigot, ...) are called as "result=$(fn ...)" to capture a
+    # single machine-readable return value on stdout. Logging on stdout would
+    # silently corrupt that value with human-readable log lines.
+    local line
+    line="$(date -u +%FT%TZ) $*"
+    echo "$line" >&2
+    { mkdir -p "$(dirname "$MINEBACK_LOG")" 2>/dev/null && echo "$line" >> "$MINEBACK_LOG"; } 2>/dev/null || true
+}
+
+die() { log "ERROR: $*"; exit 1; }
+
+# ── transport: talk to mineback-receive, locally or over ssh ────────────
+# Every call is one verb of the put/confirm/commit-manifest protocol
+# implemented by vault/mineback-receive. See its header comment for the
+# exact wire contract.
+vault_call() {
+    # vault_call VERB ARG... < stdin(optional) > stdout
+    if [ "$MINEBACK_VAULT" = "local" ]; then
+        "$MINEBACK_RECEIVE_BIN" "$@"
+        return $?
+    fi
+
+    local target="${MINEBACK_VAULT#ssh://}"
+    local host="${target%%:*}"
+    local port="22"
+    [[ "$target" == *:* ]] && port="${target##*:}"
+    local sshopts=(-o BatchMode=yes -o ConnectTimeout=10 -p "$port")
+    [ -n "$MINEBACK_VAULT_SSH_KEY" ] && sshopts+=(-i "$MINEBACK_VAULT_SSH_KEY")
+    ssh "${sshopts[@]}" "$host" -- mineback-receive "$@"
+}
+
+# ── send one artifact through put -> compare hash -> confirm ────────────
+# Reads the artifact bytes from stdin. On success, echoes a JSON-ish
+# "sha256|bytes" pair on stdout for the caller to fold into the manifest.
+# Returns non-zero (and prints nothing) on any failure.
+send_artifact() {
+    local kind="$1" host="$2" scope="$3" snap="$4" art="$5"
+    # kind: "server" or "fleet"; scope: server name (server) or "-" (fleet)
+
+    local spool tee_out local_hash
+    if [ -n "${MINEBACK_SPOOL_DIR:-}" ]; then
+        # Spool-then-send: for links too flaky to hold one long stream.
+        mkdir -p "$MINEBACK_SPOOL_DIR" || return 1
+        spool="$(mktemp "$MINEBACK_SPOOL_DIR/mineback-XXXXXX.part")"
+        cat > "$spool" || { rm -f "$spool"; return 1; }
+        local_hash="$(sha256sum "$spool" | awk '{print $1}')"
+        local remote_out
+        if [ "$kind" = "server" ]; then
+            remote_out="$(vault_call put "$host" "$scope" "$snap" "$art" < "$spool")"
+        else
+            remote_out="$(vault_call put-fleet "$host" "$snap" "$art" < "$spool")"
+        fi
+        rm -f "$spool"
+    else
+        # Pure streaming: hash while sending, no temp file on the agent host.
+        local hashfile
+        hashfile="$(mktemp)"
+        local remote_out
+        if [ "$kind" = "server" ]; then
+            remote_out="$(tee >(sha256sum | awk '{print $1}' > "$hashfile") \
+                | vault_call put "$host" "$scope" "$snap" "$art")"
+        else
+            remote_out="$(tee >(sha256sum | awk '{print $1}' > "$hashfile") \
+                | vault_call put-fleet "$host" "$snap" "$art")"
+        fi
+        wait
+        local_hash="$(cat "$hashfile")"
+        rm -f "$hashfile"
+    fi
+
+    [[ "$remote_out" == OK\ * ]] || { log "put failed for $art: $remote_out"; return 1; }
+    local remote_hash remote_bytes
+    remote_hash="$(awk '{print $2}' <<<"$remote_out")"
+    remote_bytes="$(awk '{print $3}' <<<"$remote_out")"
+
+    if [ "$local_hash" != "$remote_hash" ]; then
+        log "checksum mismatch for $art: agent=$local_hash vault=$remote_hash"
+        return 1
+    fi
+
+    local confirm_out
+    if [ "$kind" = "server" ]; then
+        confirm_out="$(vault_call confirm "$host" "$scope" "$snap" "$art" "$local_hash")"
+    else
+        confirm_out="$(vault_call confirm-fleet "$host" "$snap" "$art" "$local_hash")"
+    fi
+    [ "$confirm_out" = "OK" ] || { log "confirm failed for $art: $confirm_out"; return 1; }
+
+    echo "${local_hash}|${remote_bytes}"
+    return 0
+}
+
+# ── docker helpers ────────────────────────────────────────────────────
+container_running() {
+    [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = "true" ]
+}
+
+console() {
+    # Send a console command the same way announce.sh does — no RCON port.
+    docker exec -T "$1" bash -c "echo '$2' > /proc/1/fd/0" 2>/dev/null
+}
+
+wait_for_flush() {
+    local c="$1" timeout="$2" since
+    since="$(date -u +%FT%TZ)"
+    timeout "$timeout" docker logs --since "$since" -f "$c" 2>&1 \
+        | grep -qm1 "Saved the game" && return 0
+    return 1
+}
+
+wait_for_started() {
+    local c="$1" timeout="$2" since
+    since="$(date -u +%FT%TZ)"
+    timeout "$timeout" docker logs --since "$since" -f "$c" 2>&1 \
+        | grep -qm1 -E '^\[.*\]: Done \(' && return 0
+    return 1
+}
+
+count_files() { docker exec -T "$1" bash -c "find '$2' -type f 2>/dev/null | wc -l" 2>/dev/null || echo 0; }
+
+# ── quiesce a server, always undo it, even on failure ────────────────
+QUIESCE_ACTIVE=""
+QUIESCE_CONTAINER=""
+quiesce_start() {
+    local c="$1" method="$2"
+    QUIESCE_CONTAINER="$c"
+    if [ "$method" = "cold" ]; then
+        docker exec -T "$c" touch /server/.stopped
+        # The match pattern is passed as an env var, NOT embedded in the
+        # `bash -c "..."` string: `pkill -f` scans every process's full
+        # command line, including its own wrapping `bash -c` invocation —
+        # and that invocation's cmdline literally contains the pattern text
+        # if it's written inline here, so pkill would match and kill its own
+        # parent shell instead of (or as well as) the java process. An env
+        # var is invisible to `-f` matching, so this sidesteps that entirely.
+        docker exec -T -e MB_PAT='spigot-.*\.jar' "$c" bash -c 'pkill -TERM -f "$MB_PAT" 2>/dev/null || true'
+        local waited=0
+        while [ "$waited" -lt "$MINEBACK_STOP_TIMEOUT" ]; do
+            docker exec -T -e MB_PAT='spigot-.*\.jar' "$c" bash -c 'pgrep -f "$MB_PAT" >/dev/null 2>&1' || break
+            sleep 1; waited=$((waited+1))
+        done
+        QUIESCE_ACTIVE="cold"
+    else
+        console "$c" "save-off"
+        console "$c" "save-all flush"
+        if wait_for_flush "$c" "$MINEBACK_FLUSH_TIMEOUT"; then
+            QUIESCE_ACTIVE="hot-confirmed"
+        else
+            log "WARN: flush confirmation not seen within ${MINEBACK_FLUSH_TIMEOUT}s for $c"
+            QUIESCE_ACTIVE="hot-unconfirmed"
+        fi
+    fi
+}
+quiesce_end() {
+    [ -z "$QUIESCE_ACTIVE" ] && return 0
+    case "$QUIESCE_ACTIVE" in
+        cold)
+            docker exec -T "$QUIESCE_CONTAINER" rm -f /server/.stopped
+            ;;
+        hot-*)
+            console "$QUIESCE_CONTAINER" "save-on"
+            ;;
+    esac
+    QUIESCE_ACTIVE=""
+}
+trap 'quiesce_end' EXIT
+
+# ── pack + send one part for one spigot server ───────────────────────
+# No eval: every docker-exec'd command below is a literal string with only
+# already-validated identifiers ($c is a container name checked against
+# ID_RE-equivalent server-name validation before this is ever called; $part
+# only ever reaches here as one of the five literal case labels).
+# Returns 0 and prints "sha256|bytes|entries" on success; 2 means "part
+# intentionally skipped" (missing state files / no age recipients).
+pack_part_spigot() {
+    local c="$1" server="$2" snap="$3" part="$4"
+    local art="${part}.zip" entries=0 out rc=0
+
+    # set -o pipefail is scoped to each command-substitution subshell below —
+    # it must NOT be global (wait_for_flush/wait_for_started rely on a grep
+    # match still counting as success even if the upstream `docker logs`
+    # writer gets SIGPIPE'd once grep -m1 stops reading).
+    case "$part" in
+        cfg|plugins|worlds)
+            entries="$(count_files "$c" "/server/data/$part")"
+            out="$(set -o pipefail; docker exec -T "$c" bash -c "cd /server/data && zip -qr - '$part'" \
+                | send_artifact server "$MINEBACK_HOST_ID" "$server" "$snap" "$art")"
+            rc=$?
+            ;;
+        state)
+            # Loose files Spigot writes outside data/ — see ARCHITECTURE.md §2.
+            local filelist
+            filelist="$(docker exec -T "$c" bash -c '
+                cd /server
+                for f in whitelist.json ops.json banned-players.json banned-ips.json \
+                         usercache.json permissions.yml help.yml .version; do
+                    [ -f "$f" ] && echo "$f"
+                done')"
+            [ -z "$filelist" ] && { log "no state files present on $c — skipping state.zip"; return 2; }
+            entries="$(wc -l <<<"$filelist")"
+            out="$(set -o pipefail; docker exec -T "$c" bash -c "cd /server && zip -q - $(printf "%q " $filelist)" \
+                | send_artifact server "$MINEBACK_HOST_ID" "$server" "$snap" "$art")"
+            rc=$?
+            ;;
+        secrets)
+            [ -z "$MINEBACK_RECIPIENTS_FILE" ] && { log "MINEBACK_RECIPIENTS_FILE not set — skipping secrets.age"; return 2; }
+            [ -f "$MINEBACK_RECIPIENTS_FILE" ] || { log "recipients file not found: $MINEBACK_RECIPIENTS_FILE"; return 2; }
+            command -v age >/dev/null 2>&1 || { log "age binary not found on agent host — skipping secrets.age"; return 2; }
+            art="secrets.age"
+            entries=4
+            out="$(set -o pipefail; docker exec -T "$c" bash -c "cd /server && zip -q - ssh_host_ed25519_key ssh_host_ed25519_key.pub ssh_host_rsa_key ssh_host_rsa_key.pub" \
+                | age -R "$MINEBACK_RECIPIENTS_FILE" \
+                | send_artifact server "$MINEBACK_HOST_ID" "$server" "$snap" "$art")"
+            rc=$?
+            ;;
+        *) log "unknown part '$part'"; return 2 ;;
+    esac
+
+    if [ $rc -ne 0 ]; then
+        log "$c: pipeline failed while packing '$part' (exit $rc)"
+        return 1
+    fi
+
+    [ -n "$out" ] || return 1
+    echo "${out}|${entries}"
+}
+
+# ── snapshot one spigot server ────────────────────────────────────────
+snapshot_server() {
+    local server="$1" reason="$2" method="$3" parts="$4" dry_run="$5"
+
+    if ! container_running "$server"; then
+        log "$server: not running — skipped"
+        echo "SKIPPED"
+        return 1
+    fi
+
+    local snap
+    snap="$(date -u +%Y%m%dT%H%M%SZ)"
+    log "$server: snapshot $snap (reason=$reason method=$method)"
+
+    if [ "$dry_run" = "1" ]; then
+        log "$server: [dry-run] would quiesce ($method), pack [$parts], push as $MINEBACK_HOST_ID/$server/$snap"
+        echo "DRYRUN"
+        return 0
+    fi
+
+    local spigot_version level_name
+    spigot_version="$(docker exec -T "$server" bash -c 'cat /server/.version 2>/dev/null | tr -d "[:space:]"' )"
+    [ -z "$spigot_version" ] && spigot_version="$(docker exec -T "$server" bash -c 'echo ${SPIGOT_VERSION:-unknown}')"
+    level_name="$(docker exec -T "$server" bash -c 'echo ${MC_LEVELNAME:-world}')"
+
+    quiesce_start "$server" "$method"
+
+    local -A ART_HASH ART_BYTES ART_ENTRIES
+    local ok=1
+    for part in $parts; do
+        local out
+        out="$(pack_part_spigot "$server" "$server" "$snap" "$part")"
+        local rc=$?
+        if [ $rc -eq 2 ]; then
+            continue   # part intentionally skipped (missing recipients/age/state files)
+        elif [ $rc -ne 0 ] || [ -z "$out" ]; then
+            log "$server: FAILED packing part '$part'"
+            ok=0
+            continue
+        fi
+        local art="${part}.zip"; [ "$part" = "secrets" ] && art="secrets.age"
+        ART_HASH["$art"]="$(cut -d'|' -f1 <<<"$out")"
+        ART_BYTES["$art"]="$(cut -d'|' -f2 <<<"$out")"
+        ART_ENTRIES["$art"]="$(cut -d'|' -f3 <<<"$out")"
+        log "$server: $art ok (${ART_BYTES[$art]} bytes)"
+    done
+
+    quiesce_end
+
+    if [ "$ok" != "1" ] || [ ${#ART_HASH[@]} -eq 0 ]; then
+        log "$server: snapshot $snap NOT committed (packing failures)"
+        echo "FAILED"
+        return 1
+    fi
+
+    # ── build manifest.json ──────────────────────────────────────────
+    local flush_ok="true"
+    [ "$QUIESCE_ACTIVE" = "hot-unconfirmed" ] && flush_ok="false"
+    local started finished
+    finished="$(date -u +%FT%TZ)"
+    started="$finished"
+
+    local artifacts_json="" first=1
+    for art in "${!ART_HASH[@]}"; do
+        [ $first -eq 1 ] && first=0 || artifacts_json+=","
+        artifacts_json+=$(printf '"%s":{"bytes":%s,"sha256":"%s","entries":%s%s}' \
+            "$art" "${ART_BYTES[$art]}" "${ART_HASH[$art]}" "${ART_ENTRIES[$art]:-0}" \
+            "$([ "$art" = "secrets.age" ] && echo ',"encrypted":true')")
+    done
+
+    local manifest
+    manifest=$(cat <<JSON
+{
+  "schema": 1,
+  "snapshot_id": "$snap",
+  "host_id": "$MINEBACK_HOST_ID",
+  "server": "$server",
+  "kind": "spigot",
+  "reason": "$reason",
+  "started_at": "$started",
+  "finished_at": "$finished",
+  "status": "complete",
+  "quiesce": {"method": "$method", "save_flush_confirmed": $flush_ok},
+  "source": {"spigot_version": "$spigot_version", "level_name": "$level_name", "agent_version": "0.1.0"},
+  "artifacts": {$artifacts_json}
+}
+JSON
+)
+    local commit_out
+    commit_out="$(vault_call commit-manifest "$MINEBACK_HOST_ID" "$server" "$snap" <<<"$manifest")"
+    if [ "$commit_out" != "OK" ]; then
+        log "$server: manifest commit FAILED: $commit_out"
+        echo "FAILED"
+        return 1
+    fi
+    log "$server: snapshot $snap COMPLETE"
+    echo "$snap"
+    return 0
+}
+
+# ── snapshot the BungeeCord proxy (kind=proxy: cfg + plugins only) ─────
+snapshot_proxy() {
+    local server="$1" reason="$2" dry_run="$3"
+    if ! container_running "$server"; then
+        log "$server: not running — skipped"; echo "SKIPPED"; return 1
+    fi
+    local snap; snap="$(date -u +%Y%m%dT%H%M%SZ)"
+    if [ "$dry_run" = "1" ]; then
+        log "$server: [dry-run] would pack proxy cfg+plugins, push as $MINEBACK_HOST_ID/$server/$snap"
+        echo "DRYRUN"; return 0
+    fi
+
+    local cfg_out plugins_out rc1 rc2
+    cfg_out="$(set -o pipefail; docker exec -T "$server" bash -c "cd /bungee && zip -q - config.yml modules.yml locations.yml 2>/dev/null" \
+        | send_artifact server "$MINEBACK_HOST_ID" "$server" "$snap" "cfg.zip")"
+    rc1=$?
+    plugins_out="$(set -o pipefail; docker exec -T "$server" bash -c "cd /bungee && zip -qr - plugins modules 2>/dev/null" \
+        | send_artifact server "$MINEBACK_HOST_ID" "$server" "$snap" "plugins.zip")"
+    rc2=$?
+
+    if [ $rc1 -ne 0 ] || [ $rc2 -ne 0 ] || [ -z "$cfg_out" ] || [ -z "$plugins_out" ]; then
+        log "$server: FAILED"; echo "FAILED"; return 1
+    fi
+
+    local manifest
+    manifest=$(cat <<JSON
+{
+  "schema": 1, "snapshot_id": "$snap", "host_id": "$MINEBACK_HOST_ID", "server": "$server",
+  "kind": "proxy", "reason": "$reason",
+  "finished_at": "$(date -u +%FT%TZ)", "status": "complete",
+  "quiesce": {"method": "none"},
+  "artifacts": {
+    "cfg.zip": {"bytes": $(cut -d'|' -f2 <<<"$cfg_out"), "sha256": "$(cut -d'|' -f1 <<<"$cfg_out")", "entries": 0},
+    "plugins.zip": {"bytes": $(cut -d'|' -f2 <<<"$plugins_out"), "sha256": "$(cut -d'|' -f1 <<<"$plugins_out")", "entries": 0}
+  }
+}
+JSON
+)
+    vault_call commit-manifest "$MINEBACK_HOST_ID" "$server" "$snap" <<<"$manifest" | grep -q OK \
+        && { echo "$snap"; return 0; } || { echo "FAILED"; return 1; }
+}
+
+# ── fleet: host config (compose files, local overrides, .env, keys) ──
+# NOTE: called PLAINLY, never as `x=$(snapshot_hostconf ...)` — command
+# substitution runs in a subshell, and an earlier version that captured this
+# function's output that way lost every one of these global assignments
+# silently when the subshell exited, so no fleet manifest ever got committed.
+#
+# The fleet snapshot id is generated by the CALLER (cmd_snapshot), not here,
+# and is always committed once every server has been attempted — regardless
+# of whether hostconf capture itself is configured/succeeds. Host config is
+# one optional ingredient of a fleet snapshot, not a gate on the servers'
+# snapshot-id references being recorded at all.
+#
+# Sets: HOSTCONF_RESULT ("SKIPPED"/"DRYRUN"/"FAILED"/snapshot id),
+#       HOSTCONF_MHS_COMMIT, HOSTCONF_ARTIFACTS_JSON (empty if nothing to add).
+snapshot_hostconf() {
+    local reason="$1" dry_run="$2" snap="$3"
+    HOSTCONF_RESULT=""; HOSTCONF_MHS_COMMIT=""; HOSTCONF_ARTIFACTS_JSON=""
+
+    [ -z "$MINEBACK_MHS_DIR" ] && { log "MINEBACK_MHS_DIR not set — skipping hostconf"; HOSTCONF_RESULT="SKIPPED"; return 2; }
+    [ -d "$MINEBACK_MHS_DIR" ] || { log "MINEBACK_MHS_DIR not found: $MINEBACK_MHS_DIR"; HOSTCONF_RESULT="SKIPPED"; return 2; }
+
+    if [ "$dry_run" = "1" ]; then
+        log "hostconf: [dry-run] would pack $MINEBACK_MHS_DIR (excl. .git/.env/keys), push as $MINEBACK_HOST_ID/fleets/$snap"
+        HOSTCONF_RESULT="DRYRUN"; return 0
+    fi
+
+    if [ -d "$MINEBACK_MHS_DIR/.git" ]; then
+        HOSTCONF_MHS_COMMIT="$(git -C "$MINEBACK_MHS_DIR" rev-parse --short HEAD 2>/dev/null)"
+    fi
+
+    local hostconf_out
+    hostconf_out="$(set -o pipefail; (cd "$MINEBACK_MHS_DIR" && zip -qr - . -x '.git/*' -x '.env' -x 'keys/*') \
+        | send_artifact fleet "$MINEBACK_HOST_ID" - "$snap" "hostconf.zip")"
+    if [ $? -ne 0 ] || [ -z "$hostconf_out" ]; then
+        log "hostconf.zip FAILED"; HOSTCONF_RESULT="FAILED"; return 1
+    fi
+
+    local secrets_out=""
+    if [ -n "$MINEBACK_RECIPIENTS_FILE" ] && [ -f "$MINEBACK_RECIPIENTS_FILE" ] && command -v age >/dev/null 2>&1; then
+        secrets_out="$( (cd "$MINEBACK_MHS_DIR" && zip -qr - .env keys 2>/dev/null) \
+            | age -R "$MINEBACK_RECIPIENTS_FILE" \
+            | send_artifact fleet "$MINEBACK_HOST_ID" - "$snap" "hostconf-secrets.age")"
+    else
+        log "WARN: not encrypting .env/keys — no recipients file / age binary; hostconf-secrets.age skipped"
+    fi
+
+    HOSTCONF_ARTIFACTS_JSON=$(printf '"hostconf.zip":{"bytes":%s,"sha256":"%s"}' \
+        "$(cut -d'|' -f2 <<<"$hostconf_out")" "$(cut -d'|' -f1 <<<"$hostconf_out")")
+    if [ -n "$secrets_out" ]; then
+        HOSTCONF_ARTIFACTS_JSON+=$(printf ',"hostconf-secrets.age":{"bytes":%s,"sha256":"%s","encrypted":true}' \
+            "$(cut -d'|' -f2 <<<"$secrets_out")" "$(cut -d'|' -f1 <<<"$secrets_out")")
+    fi
+
+    HOSTCONF_RESULT="$snap"
+    return 0
+}
+
+# ── command: selftest ─────────────────────────────────────────────────
+cmd_selftest() {
+    local fail=0
+    check() { if eval "$2"; then log "OK   $1"; else log "FAIL $1"; fail=1; fi; }
+
+    check "MINEBACK_HOST_ID is set"        '[ -n "$MINEBACK_HOST_ID" ]'
+    check "MINEBACK_VAULT is set"          '[ -n "$MINEBACK_VAULT" ]'
+    check "docker is available"            'command -v docker >/dev/null 2>&1'
+    check "zip is available"               'command -v zip >/dev/null 2>&1'
+    check "age is available"               'command -v age >/dev/null 2>&1'
+    check "ssh is available"               'command -v ssh >/dev/null 2>&1'
+    check "zip can stream to stdout"       'zip -q - /etc/hostname >/dev/null 2>&1'
+
+    if [ -n "$MINEBACK_RECIPIENTS_FILE" ]; then
+        check "recipients file exists"     '[ -f "$MINEBACK_RECIPIENTS_FILE" ]'
+    else
+        log "WARN MINEBACK_RECIPIENTS_FILE not set — secrets will not be encrypted"
+    fi
+
+    if [ "$MINEBACK_VAULT" = "local" ]; then
+        check "mineback-receive on PATH"   'command -v "$MINEBACK_RECEIVE_BIN" >/dev/null 2>&1'
+    else
+        local target="${MINEBACK_VAULT#ssh://}"; local host="${target%%:*}"
+        check "vault reachable over ssh"   'ssh -o BatchMode=yes -o ConnectTimeout=5 ${MINEBACK_VAULT_SSH_KEY:+-i "$MINEBACK_VAULT_SSH_KEY"} "$host" -- true'
+    fi
+
+    for s in $MINEBACK_SERVERS $MINEBACK_LOBBY; do
+        if container_running "$s"; then log "OK   $s is running"; else log "WARN $s is not running"; fi
+    done
+
+    df -h /var/lib/docker 2>/dev/null | tail -1 | while read -r fs size used avail pct mnt; do
+        log "disk on /var/lib/docker: $avail free ($pct used)"
+    done
+
+    [ $fail -eq 0 ] && log "selftest: PASS" || log "selftest: FAIL"
+    return $fail
+}
+
+# ── command: snapshot ──────────────────────────────────────────────────
+cmd_snapshot() {
+    local fleet=0 cold=0 reason="scheduled" parts="$ALL_PARTS" dry_run=0
+    local -a targets=()
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --fleet) fleet=1 ;;
+            --cold) cold=1 ;;
+            --reason) reason="$2"; shift ;;
+            --parts) parts="$(tr ',' ' ' <<<"$2")"; shift ;;
+            --dry-run) dry_run=1 ;;
+            -*) die "unknown option: $1" ;;
+            *) targets+=("$1") ;;
+        esac
+        shift
+    done
+
+    [ -n "$MINEBACK_HOST_ID" ] || die "MINEBACK_HOST_ID is not configured"
+    [ -n "$MINEBACK_VAULT" ]   || die "MINEBACK_VAULT is not configured"
+    [[ "$MINEBACK_HOST_ID" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || die "invalid MINEBACK_HOST_ID '$MINEBACK_HOST_ID'"
+
+    local method="hot"; [ $cold -eq 1 ] && method="cold"
+
+    if [ $fleet -eq 1 ]; then
+        targets=($MINEBACK_LOBBY $MINEBACK_SERVERS)
+    fi
+    [ ${#targets[@]} -eq 0 ] && targets=($MINEBACK_SERVERS)
+
+    # Every container/server name is used unquoted-safe inside docker-exec'd
+    # shell strings below — reject anything that isn't a plain identifier
+    # before it ever reaches a command line (defends the agent host itself,
+    # independent of the vault's own name validation in mineback-receive).
+    for t in "${targets[@]}" "$MINEBACK_PROXY"; do
+        [[ "$t" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || die "invalid server name: '$t'"
+    done
+
+    local total=0 ok=0 skipped=0 failed=0
+    local servers_json="" servers_first=1
+    add_server_json() {
+        # Appends "name":<value-or-error-object> to servers_json — this is
+        # what lets `mineback restore fleet` find each server's snapshot id
+        # (ARCHITECTURE.md §5's fleet-snapshot "servers" map).
+        local name="$1" outcome="$2" snap_or_msg="$3"
+        [ $servers_first -eq 1 ] && servers_first=0 || servers_json+=","
+        if [ "$outcome" = "ok" ]; then
+            servers_json+=$(printf '"%s":"%s"' "$name" "$snap_or_msg")
+        else
+            servers_json+=$(printf '"%s":{"snapshot":null,"error":"%s"}' "$name" "$snap_or_msg")
+        fi
+    }
+
+    printf '%-10s %-12s %-20s\n' "SERVER" "RESULT" "SNAPSHOT"
+    for s in "${targets[@]}"; do
+        total=$((total+1))
+        local result
+        result="$(snapshot_server "$s" "$reason" "$method" "$parts" "$dry_run")"
+        case "$result" in
+            SKIPPED) skipped=$((skipped+1)); printf '%-10s %-12s %-20s\n' "$s" "skipped" "-"
+                     add_server_json "$s" err "container not running" ;;
+            FAILED)  failed=$((failed+1));   printf '%-10s %-12s %-20s\n' "$s" "FAILED" "-"; EXIT_CODE=1
+                     add_server_json "$s" err "packing failed" ;;
+            DRYRUN)  printf '%-10s %-12s %-20s\n' "$s" "dry-run" "-" ;;
+            *)       ok=$((ok+1));           printf '%-10s %-12s %-20s\n' "$s" "ok" "$result"
+                     add_server_json "$s" ok "$result" ;;
+        esac
+    done
+
+    if [ $fleet -eq 1 ]; then
+        local presult
+        presult="$(snapshot_proxy "$MINEBACK_PROXY" "$reason" "$dry_run")"
+        case "$presult" in
+            SKIPPED) skipped=$((skipped+1)); printf '%-10s %-12s %-20s\n' "$MINEBACK_PROXY" "skipped" "-"
+                     add_server_json "$MINEBACK_PROXY" err "container not running" ;;
+            FAILED)  failed=$((failed+1));   printf '%-10s %-12s %-20s\n' "$MINEBACK_PROXY" "FAILED" "-"; EXIT_CODE=1
+                     add_server_json "$MINEBACK_PROXY" err "packing failed" ;;
+            DRYRUN)  printf '%-10s %-12s %-20s\n' "$MINEBACK_PROXY" "dry-run" "-" ;;
+            *)       ok=$((ok+1));           printf '%-10s %-12s %-20s\n' "$MINEBACK_PROXY" "ok" "$presult"
+                     add_server_json "$MINEBACK_PROXY" ok "$presult" ;;
+        esac
+
+        # The fleet snapshot id is generated here, unconditionally — hostconf
+        # capture is one optional ingredient, not a gate on the fleet
+        # manifest (and its "servers" references) being committed at all.
+        FLEET_SNAP="$(date -u +%Y%m%dT%H%M%SZ)"
+        snapshot_hostconf "$reason" "$dry_run" "$FLEET_SNAP"
+        printf '%-10s %-12s %-20s\n' "hostconf" "$HOSTCONF_RESULT" "$FLEET_SNAP"
+        if [ "$HOSTCONF_RESULT" = "SKIPPED" ] || [ "$HOSTCONF_RESULT" = "FAILED" ]; then
+            skipped=$((skipped+1))   # counts toward "partial", same as a down server
+        fi
+
+        if [ "$dry_run" != "1" ]; then
+            local status="complete"
+            if [ $failed -gt 0 ] || [ $skipped -gt 0 ]; then
+                status="partial"
+            fi
+            local fleet_manifest
+            fleet_manifest=$(printf '{"schema":1,"snapshot_id":"%s","host_id":"%s","reason":"%s","mhs_commit":"%s","mode":"bungeecord","status":"%s","artifacts":{%s},"servers":{%s}}' \
+                "$FLEET_SNAP" "$MINEBACK_HOST_ID" "$reason" "$HOSTCONF_MHS_COMMIT" "$status" "$HOSTCONF_ARTIFACTS_JSON" "$servers_json")
+            local fc
+            fc="$(vault_call commit-fleet-manifest "$MINEBACK_HOST_ID" "$FLEET_SNAP" <<<"$fleet_manifest")"
+            [ "$fc" = "OK" ] || { log "fleet manifest commit FAILED: $fc"; EXIT_CODE=1; }
+        fi
+    fi
+
+    log "summary: total=$total ok=$ok skipped=$skipped failed=$failed"
+    [ $failed -gt 0 ] && EXIT_CODE=1
+    [ $skipped -gt 0 ] && [ $fleet -eq 1 ] && EXIT_CODE=1   # a down container is a partial fleet, not a clean run
+    return $EXIT_CODE
+}
+
+# ── main ────────────────────────────────────────────────────────────
+CMD="${1:-}"; shift || true
+case "$CMD" in
+    selftest) cmd_selftest ;;
+    snapshot) cmd_snapshot "$@" ;;
+    *)
+        cat >&2 <<EOF
+Usage: mineback-agent selftest
+       mineback-agent snapshot [server...] [--fleet] [--cold] [--reason TEXT]
+                               [--parts cfg,plugins,worlds,state,secrets] [--dry-run]
+EOF
+        exit 2
+        ;;
+esac
+exit $EXIT_CODE

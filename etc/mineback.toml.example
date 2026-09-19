@@ -1,0 +1,40 @@
+# mineback.toml — vault configuration. Copy to /etc/mineback/mineback.toml.
+# See ARCHITECTURE.md §6 for the on-disk layout this points at.
+
+home = "/var/lib/mineback"
+
+[vault]
+# Private age identity used to decrypt secrets.age / hostconf-secrets.age
+# during restore. Keep this at 0600, and keep an offline (paper/USB) copy —
+# losing it turns a full host restore (R7) into a manual rebuild.
+age_identity = "/etc/mineback/vault_identity.txt"
+
+# ── retention (L1-L3) ──────────────────────────────────────────────────
+# Grandfather-father-son. Evaluated per server; keep_reasons are never
+# pruned regardless of age. `mineback vault prune` is dry-run unless --yes.
+[retention]
+keep_last    = 3
+keep_daily   = 7
+keep_weekly  = 4
+keep_monthly = 6
+keep_reasons = ["pre-restore", "pre-version", "workshop-final"]
+
+# Per-server override — e.g. a server whose world is unusually large or
+# whose history matters more/less than the fleet default (L2).
+# [retention_overrides.mc4]
+# keep_last  = 2
+# keep_daily = 3
+
+# ── hosts (O1) ───────────────────────────────────────────────────────────
+# One [hosts.<host-id>] block per hosting host enrolled with `mineback host
+# add <id>`. `address` is used two ways: as `docker -H <address>` for
+# restore (R2/R6/R7), and as the ssh target for pre-restore safety snapshots
+# (R5) — both need admin-level SSH access to that host, separate from the
+# agent's own restricted backup-only key.
+[hosts.kag-workshop-01]
+address = "ssh://root@10.0.0.5"
+mhs_dir = "/root/hostMC/minecraftHostingServer"   # for fleet restore (R7)
+
+# A host with no `address` is assumed to be this same machine (local docker
+# socket) — that's the normal case only if the vault and a hosting host are
+# genuinely the same box, which is unusual outside of testing.

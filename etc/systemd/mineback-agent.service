@@ -1,0 +1,15 @@
+[Unit]
+Description=mineback — fleet snapshot of this MHS host
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/mineback-agent snapshot --fleet
+# Backup failures must never look like anything happened to the servers
+# themselves — this unit only ever reads container state and data, it does
+# not stop/restart the MHS stack. A non-zero exit here means "check the
+# fleet is fully backed up", not "something is broken with Minecraft".
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

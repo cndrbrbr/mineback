@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+"""mineback — vault-side CLI. Python 3 stdlib only (see ARCHITECTURE.md §3).
+
+Run `mineback <command> --help` for details on any subcommand.
+"""
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from mineback_lib import catalog, config as configmod, publish, restore, retention, store, verify
+
+
+def human_bytes(n: int) -> str:
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.1f}{unit}" if unit != "B" else f"{int(n)}{unit}"
+        n /= 1024
+    return f"{n:.1f}TB"
+
+
+def parse_since(s: str) -> str:
+    """'7d' / '24h' -> an ISO timestamp `finished_at >= ...` can compare against."""
+    m = re.match(r"^(\d+)([dh])$", s)
+    if not m:
+        raise SystemExit(f"invalid --since value: {s!r} (expected e.g. 7d or 24h)")
+    n, unit = int(m.group(1)), m.group(2)
+    delta = timedelta(days=n) if unit == "d" else timedelta(hours=n)
+    return (datetime.now(timezone.utc) - delta).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def confirm_and_run(fn, needs_confirmation_kwargs: dict, yes: bool):
+    """Runs fn(**kwargs); on NeedsConfirmation, shows the plan and prompts
+    unless --yes was already given (in which case fn was already called with
+    yes=True by the caller and this path isn't reached)."""
+    try:
+        return fn(**needs_confirmation_kwargs)
+    except restore.NeedsConfirmation as e:
+        print("\n".join(e.plan_lines))
+        answer = input("Proceed? [y/N] ").strip().lower()
+        if answer != "y":
+            print("Aborted.")
+            sys.exit(1)
+        needs_confirmation_kwargs["yes"] = True
+        return fn(**needs_confirmation_kwargs)
+
+
+# ── vault subcommands ────────────────────────────────────────────────────
+def cmd_vault_reindex(cfg, args):
+    n = catalog.reindex(cfg, host_filter=args.host)
+    if not args.quiet:
+        print(f"reindexed {n} snapshot(s)")
+
+
+def cmd_vault_publish(cfg, args):
+    if args.ref:
+        host_id, server, _snap = store.parse_ref(args.ref)
+    else:
+        host_id, server = args.host, args.server
+    if not host_id or not server:
+        raise SystemExit("usage: mineback vault publish <host>/<server>/<snapshot>  (or --host/--server)")
+    n = publish.publish_server(cfg, host_id, server)
+    print(f"published {n} date(s) for {host_id}/{server}")
+
+
+def cmd_vault_verify(cfg, args):
+    issues = verify.scrub(cfg, host=args.host, server=args.server)
+    for i in issues:
+        print(f"ISSUE  {i.ref}  {i.artifact}: {i.problem}")
+    if args.gc:
+        removed, reclaimed = verify.gc_incoming(cfg)
+        print(f"gc: removed {removed} stale incoming dir(s), reclaimed {human_bytes(reclaimed)}")
+    print(f"scrub: {len(issues)} issue(s) found" + (" — OK" if not issues else ""))
+    if issues:
+        sys.exit(1)
+
+
+def cmd_vault_prune(cfg, args):
+    dry_run = not args.yes
+    if args.host and args.server:
+        reports = [retention.prune_server(cfg, args.host, args.server, dry_run=dry_run)]
+    else:
+        reports = retention.prune_all(cfg, dry_run=dry_run)
+    total_pruned = 0
+    total_bytes = 0
+    for r in reports:
+        if not r.pruned:
+            continue
+        print(f"{r.host_id}/{r.server}: keep {len(r.kept)}, prune {len(r.pruned)}"
+              + (f" ({human_bytes(r.bytes_reclaimed)})" if not dry_run else ""))
+        for sid in r.pruned:
+            print(f"    - {sid}")
+        total_pruned += len(r.pruned)
+        total_bytes += r.bytes_reclaimed
+    if dry_run:
+        print(f"\n[dry-run] {total_pruned} snapshot(s) would be pruned. Re-run with --yes to apply.")
+    else:
+        print(f"\npruned {total_pruned} snapshot(s), reclaimed {human_bytes(total_bytes)}")
+
+
+def cmd_vault_status(cfg, args):
+    hosts = list(store.iter_hosts(cfg))
+    if not hosts:
+        print("no hosts in the store yet")
+        return
+    for host_id in hosts:
+        print(f"{host_id}:")
+        for server in store.iter_servers(cfg, host_id):
+            snaps = sorted(store.iter_server_snapshots(cfg, host_id, server), key=lambda s: s.snapshot_id)
+            if not snaps:
+                continue
+            latest = snaps[-1]
+            manifest = latest.manifest()
+            size = sum(a.get("bytes", 0) for a in manifest.get("artifacts", {}).values())
+            print(f"  {server:<10} last={latest.snapshot_id}  status={manifest.get('status','?'):<9} "
+                  f"size={human_bytes(size):>8}  count={len(snaps)}")
+    total = sum(p.stat().st_size for p in cfg.store.rglob("*") if p.is_file()) if cfg.store.is_dir() else 0
+    print(f"\nstore total: {human_bytes(total)}")
+
+
+def cmd_host_add(cfg, args):
+    print(f"# Add this to mineback.toml on the vault:")
+    print(f"[hosts.{args.host_id}]")
+    print(f'address = "ssh://root@<hosting-host-ip>"   # used for restore (docker -H) and safety snapshots')
+    print(f'# mhs_dir = "/root/hostMC/minecraftHostingServer"  # for fleet restore')
+    print()
+    print("# On the hosting host, /etc/mineback/agent.env:")
+    print(f"MINEBACK_HOST_ID={args.host_id}")
+    print("MINEBACK_VAULT=ssh://mc-backup@<this-vault-host>:22")
+    print("MINEBACK_VAULT_SSH_KEY=/etc/mineback/agent_key")
+    print("MINEBACK_RECIPIENTS_FILE=/etc/mineback/recipients.age")
+    print()
+    print("# On the vault, add a restricted key for that host's agent:")
+    print(f'  command="mineback-receive --fixed-host {args.host_id}",no-pty,no-port-forwarding,'
+          f'no-agent-forwarding,no-X11-forwarding ssh-ed25519 AAAA... agent@{args.host_id}')
+    print("  (append the agent's public key after generating it: ssh-keygen -t ed25519 -f agent_key -N '')")
+
+
+def cmd_host_ls(cfg, args):
+    for host_id in store.iter_hosts(cfg):
+        h = cfg.hosts.get(host_id)
+        addr = h.address if h else "(not configured in mineback.toml)"
+        print(f"{host_id}  {addr}")
+
+
+# ── catalog / ls / show ──────────────────────────────────────────────────
+def cmd_ls(cfg, args):
+    since_iso = parse_since(args.since) if args.since else None
+    rows = catalog.query(cfg, host=args.host, server=args.server, reason=args.reason, since_iso=since_iso)
+    if not rows:
+        print("no snapshots found")
+        return
+    print(f"{'HOST':<16} {'SERVER':<10} {'SNAPSHOT':<18} {'REASON':<12} {'STATUS':<9} {'SIZE':>9}")
+    for r in rows:
+        print(f"{r['host_id']:<16} {r['server']:<10} {r['snapshot_id']:<18} "
+              f"{(r['reason'] or '-'):<12} {r['status']:<9} {human_bytes(r['bytes_total']):>9}")
+
+
+def cmd_show(cfg, args):
+    host_id, server, snap_id = store.parse_ref(args.ref)
+    if snap_id is None:
+        snap = store.resolve_selector(cfg, host_id, server, "latest")
+    else:
+        snap = store.resolve_selector(cfg, host_id, server, snap_id)
+    import json
+    print(json.dumps(snap.manifest(), indent=2))
+
+
+# ── restore / export / drill ─────────────────────────────────────────────
+def cmd_restore_server(cfg, args):
+    parts = args.parts.split(",") if args.parts else list(restore.DEFAULT_PARTS)
+    if args.with_secrets and "secrets" not in parts:
+        parts.append("secrets")
+    host_id, server, _ = store.parse_ref(args.ref)
+
+    kwargs = dict(
+        cfg=cfg, host_id=host_id, server=server, selector=args.snapshot, parts=parts,
+        to=args.to, dry_run=args.dry_run, yes=args.yes, no_safety=args.no_safety,
+        age_identity=cfg.age_identity,
+    )
+    if args.dry_run:
+        report = restore.restore_server(**kwargs)
+        print("\n".join(restore.describe_plan(report.plan)))
+        return
+
+    report = confirm_and_run(restore.restore_server, kwargs, args.yes)
+    print(f"restored {report.plan.source_ref} -> {report.plan.target_host}/{report.plan.target_server}")
+    print(f"  safety snapshot: {report.safety_snapshot}")
+    print(f"  server started:  {report.started}")
+    if not report.started:
+        print("  WARNING: server did not report 'Done (' within the timeout — check logs")
+        sys.exit(1)
+
+
+def cmd_restore_fleet(cfg, args):
+    kwargs = dict(
+        cfg=cfg, host_id=args.host, selector=args.snapshot, to=args.to,
+        servers=args.servers.split(",") if args.servers else None,
+        dry_run=args.dry_run, yes=args.yes, with_secrets=not args.no_secrets,
+        age_identity=cfg.age_identity,
+    )
+    if args.dry_run:
+        results = restore.restore_fleet(**kwargs)
+    else:
+        try:
+            results = restore.restore_fleet(**kwargs)
+        except restore.NeedsConfirmation as e:
+            print("\n".join(e.plan_lines))
+            answer = input("Proceed with the FULL FLEET restore? [y/N] ").strip().lower()
+            if answer != "y":
+                print("Aborted.")
+                sys.exit(1)
+            kwargs["yes"] = True
+            results = restore.restore_fleet(**kwargs)
+
+    failed = 0
+    for r in results:
+        print(f"{r.server:<10} {r.status}")
+        if r.status.startswith("FAILED"):
+            failed += 1
+    print(
+        "\nNote: host-level bring-up (git clone/checkout of MHS, docker compose "
+        "build/up, decrypting hostconf-secrets.age into .env/keys/) is not yet "
+        "automated by this command — see ARCHITECTURE.md §9.3 steps 1-3. This "
+        "restored every server's data onto an already-running stack."
+    )
+    if failed:
+        sys.exit(1)
+
+
+def cmd_export(cfg, args):
+    host_id, server, _ = store.parse_ref(args.ref)
+    out = Path(args.out)
+    restore.export_snapshot(cfg, host_id, server, args.snapshot, out)
+    print(f"wrote {out} ({human_bytes(out.stat().st_size)})")
+
+
+def cmd_drill(cfg, args):
+    host_id, server, _ = store.parse_ref(args.ref)
+    target = args.to or f"{host_id}/{server}-drill"
+    print(f"drill: restoring {host_id}/{server} (latest) -> {target}")
+    try:
+        report = restore.restore_server(
+            cfg, host_id, server, "latest", list(restore.DEFAULT_PARTS),
+            to=target, dry_run=False, yes=True, no_safety=True,
+            age_identity=cfg.age_identity,
+        )
+    except restore.RestoreError as e:
+        print(f"DRILL FAILED: {e}")
+        sys.exit(1)
+    if report.started:
+        print(f"DRILL OK — {target} started successfully from {report.plan.source_ref}")
+    else:
+        print(f"DRILL FAILED — {target} did not report ready within the timeout")
+        sys.exit(1)
+
+
+# ── argument parser ────────────────────────────────────────────────────
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="mineback")
+    p.add_argument("--config", help="path to mineback.toml (default: /etc/mineback/mineback.toml)")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    vault = sub.add_parser("vault", help="vault maintenance")
+    vsub = vault.add_subparsers(dest="vault_command", required=True)
+
+    vr = vsub.add_parser("reindex", help="rebuild catalog.sqlite from manifests (V4)")
+    vr.add_argument("--host")
+    vr.add_argument("--quiet", action="store_true")
+    vr.set_defaults(func=cmd_vault_reindex)
+
+    vp = vsub.add_parser("publish", help="rebuild the compat view for one server (T8)")
+    vp.add_argument("ref", nargs="?", help="host/server/snapshot (snapshot is ignored — full rebuild)")
+    vp.add_argument("--host")
+    vp.add_argument("--server")
+    vp.set_defaults(func=cmd_vault_publish)
+
+    vv = vsub.add_parser("verify", help="scrub checksums + zip integrity (V1), optional gc (L7)")
+    vv.add_argument("--host")
+    vv.add_argument("--server")
+    vv.add_argument("--gc", action="store_true")
+    vv.set_defaults(func=cmd_vault_verify)
+
+    vpr = vsub.add_parser("prune", help="GFS retention (L1-L6); dry-run unless --yes")
+    vpr.add_argument("--host")
+    vpr.add_argument("--server")
+    vpr.add_argument("--yes", action="store_true")
+    vpr.set_defaults(func=cmd_vault_prune)
+
+    vs = vsub.add_parser("status", help="store size and last-success per server")
+    vs.set_defaults(func=cmd_vault_status)
+
+    host = sub.add_parser("host", help="manage enrolled hosting hosts")
+    hsub = host.add_subparsers(dest="host_command", required=True)
+    ha = hsub.add_parser("add", help="print the config/key skeleton for a new host (O1)")
+    ha.add_argument("host_id")
+    ha.set_defaults(func=cmd_host_add)
+    hl = hsub.add_parser("ls", help="list enrolled hosts")
+    hl.set_defaults(func=cmd_host_ls)
+
+    ls = sub.add_parser("ls", help="list snapshots")
+    ls.add_argument("--host")
+    ls.add_argument("--server")
+    ls.add_argument("--since", help="e.g. 7d or 24h")
+    ls.add_argument("--reason")
+    ls.set_defaults(func=cmd_ls)
+
+    show = sub.add_parser("show", help="print a snapshot's manifest")
+    show.add_argument("ref", help="host/server or host/server/snapshot (default snapshot: latest)")
+    show.set_defaults(func=cmd_show)
+
+    restore_p = sub.add_parser("restore", help="restore a server or a fleet")
+    rsub = restore_p.add_subparsers(dest="restore_command", required=True)
+
+    rsrv = rsub.add_parser("server", help="restore a single server (R2/R3/R5/R6/R9/R10/R11)")
+    rsrv.add_argument("ref", help="host/server")
+    rsrv.add_argument("--snapshot", default="latest", help="'latest', a snapshot id, or YYYY-MM-DD")
+    rsrv.add_argument("--parts", help="comma-separated: cfg,plugins,worlds,state,secrets (default: all but secrets)")
+    rsrv.add_argument("--with-secrets", action="store_true")
+    rsrv.add_argument("--to", help="host/server — restore onto a different slot (R6)")
+    rsrv.add_argument("--dry-run", action="store_true")
+    rsrv.add_argument("--yes", action="store_true")
+    rsrv.add_argument("--no-safety", action="store_true")
+    rsrv.set_defaults(func=cmd_restore_server)
+
+    rfleet = rsub.add_parser("fleet", help="restore every server referenced by a fleet snapshot (R7/R14)")
+    rfleet.add_argument("host")
+    rfleet.add_argument("--snapshot", default="latest")
+    rfleet.add_argument("--to")
+    rfleet.add_argument("--servers", help="comma-separated subset (R14)")
+    rfleet.add_argument("--no-secrets", action="store_true")
+    rfleet.add_argument("--dry-run", action="store_true")
+    rfleet.add_argument("--yes", action="store_true")
+    rfleet.set_defaults(func=cmd_restore_fleet)
+
+    exp = sub.add_parser("export", help="hand a world to a human, never secrets (R12)")
+    exp.add_argument("ref", help="host/server")
+    exp.add_argument("--snapshot", default="latest")
+    exp.add_argument("--out", required=True)
+    exp.set_defaults(func=cmd_export)
+
+    drill = sub.add_parser("drill", help="restore latest into a throwaway target and check it starts (V2)")
+    drill.add_argument("ref", help="host/server")
+    drill.add_argument("--to", help="host/server for the throwaway target (default: <server>-drill)")
+    drill.set_defaults(func=cmd_drill)
+
+    return p
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    cfg = configmod.load(args.config)
+    try:
+        args.func(cfg, args)
+    except (store.Invalid, store.NotFound, restore.RestoreError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

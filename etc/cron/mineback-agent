@@ -1,0 +1,5 @@
+# /etc/cron.d/mineback-agent — alternative to the systemd timer, for hosts
+# without systemd or where a simple crontab is preferred. Adjust the minute
+# per host if you run this on more than one hosting host against the same
+# vault, so their nightly runs don't all land in the same minute.
+15 2 * * *  root  /usr/local/bin/mineback-agent snapshot --fleet >> /var/log/mineback-agent.log 2>&1

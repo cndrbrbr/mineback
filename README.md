@@ -4,18 +4,20 @@ Backup and restore infrastructure for Minecraft server farms — worlds, plugins
 configs of every server deployed with
 [minecraftHostingServer](https://github.com/cndrbrbr/minecraftHostingServer) (MHS).
 
-> **Status: M1 implemented, not yet deployed to production.** The agent
+> **Status: M1 implemented and running in production.** The agent
 > (`agent/mineback-agent`), the vault receiver (`vault/mineback-receive`) and
-> the CLI (`vault/mineback`) are working code — every command below runs.
-> `tests/smoke-test.sh` exercises the full backup→restore cycle end to end
-> (single-server, fleet, proxy, selective parts, secrets, drills, GFS
-> retention) against a fake Docker shim, with no real containers or network
-> involved; run it with `bash tests/smoke-test.sh`. What's still missing
-> before a real hosting host: enrolling it (`mineback host add`), installing
-> the two `install-*.sh` scripts, and validating a real `docker exec`
-> quiesce against a live Spigot container instead of the test double. See
-> [ARCHITECTURE.md](ARCHITECTURE.md) (how and why) and
-> [FEATURES.md](FEATURES.md) (full feature list with per-item status).
+> the CLI (`vault/mineback`) are deployed and backing up three real hosts
+> nightly: a colocated standalone fleet, a remote BungeeCord fleet, and a
+> remote non-MHS host (`javascriptMinecraftWorkshopServer`) — see
+> [example3servers.md](example3servers.md). `tests/smoke-test.sh` still
+> covers the full backup→restore cycle against a fake Docker shim for fast,
+> network-free iteration (`bash tests/smoke-test.sh`), but it's no longer the
+> only thing that's been exercised: real SSH transport, real Docker, and real
+> world data all landed real bugs the shim structurally couldn't reach — see
+> [FEATURES.md](FEATURES.md)'s "Current implementation status" for exactly
+> what those were. Restore itself (R6/R7/R8) is the one area still unproven
+> against a real host — see [drill/README.md](drill/README.md) to rehearse
+> one safely. [ARCHITECTURE.md](ARCHITECTURE.md) has the full design.
 
 ---
 
@@ -235,6 +237,8 @@ A full walkthrough of installing both pieces on one machine is in
 - [ARCHITECTURE.md](ARCHITECTURE.md) — components, data model, flows, security, design decisions
 - [FEATURES.md](FEATURES.md) — feature catalogue with milestones and acceptance criteria
 - [example-setup.md](example-setup.md) — worked example: installing vault + agent colocated on one host
+- [example3servers.md](example3servers.md) — worked example: three real hosts (colocated standalone, remote BungeeCord fleet, remote non-MHS layout)
+- [drill/README.md](drill/README.md) — rehearsing a restore against a disposable local machine, no production host touched
 
 ## License
 

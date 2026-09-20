@@ -14,20 +14,39 @@ on the same VPN as the vault), skip the tunnel — just add a normal
 [example3servers.md](../example3servers.md) does for meckminecraft.de/
 codefield.de, and go straight to step 4.
 
-## 0. Authorize the vault's key on the local machine
+## 0. Authorize keys in both directions
 
-The vault drives the drill (`docker -H ssh://...`), so it needs root SSH
-access to the target, same as any other enrolled host. Print the vault's
-**SSH** public key on the vault (not the age identity — that's for decrypting
-secrets, unrelated) — whichever key the vault admin normally uses for
-`docker -H ssh://` restores (ARCHITECTURE.md §4's "admin key"):
+Two separate SSH connections are involved here, in opposite directions, each
+needing its own key authorized — easy to do only one and get a confusing
+`Permission denied` on the other.
+
+**0a. The local machine needs to reach the vault**, to open the tunnel itself
+(`ssh -R ... root@<vault>` in step 2 — that's the *local* machine connecting
+*out*). On the local machine, generate a key if it doesn't have one and print
+it:
+
+```bash
+[ -f ~/.ssh/id_ed25519.pub ] || ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519
+cat ~/.ssh/id_ed25519.pub
+```
+
+Append that to `/root/.ssh/authorized_keys` **on the vault**, and confirm from
+the local machine: `ssh root@<vault> hostname`.
+
+**0b. The vault needs to reach the local machine**, once the tunnel is up, to
+actually drive the drill (`docker -H ssh://root@localhost:<port>` in step 4 —
+that's the *vault* connecting to what looks like `localhost` but is really
+the local machine, through the tunnel). Print the vault's own key **on the
+vault** (not the age identity — that's for decrypting secrets, unrelated):
 
 ```bash
 cat ~/.ssh/id_ed25519.pub
 ```
 
-Then append it to `/root/.ssh/authorized_keys` on the local machine, and
-confirm from the vault: `ssh root@<local-machine> hostname`.
+Append that to `/root/.ssh/authorized_keys` **on the local machine**.
+Confirming this one has to wait until the tunnel from step 2 is actually
+open — there's no direct path to it yet, that's the whole reason for the
+tunnel.
 
 ## 1. Build the throwaway target
 

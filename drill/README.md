@@ -34,10 +34,13 @@ Append that to `/root/.ssh/authorized_keys` **on the vault**, and confirm from
 the local machine: `ssh root@<vault> hostname`.
 
 **0b. The vault needs to reach the local machine**, once the tunnel is up, to
-actually drive the drill (`docker -H ssh://root@localhost:<port>` in step 4 —
-that's the *vault* connecting to what looks like `localhost` but is really
-the local machine, through the tunnel). Print the vault's own key **on the
-vault** (not the age identity — that's for decrypting secrets, unrelated):
+actually drive the drill (`docker -H ssh://root@127.0.0.1:<port>` in step 4 —
+that's the *vault* connecting to what looks like its own loopback but is
+really the local machine, through the tunnel — use `127.0.0.1`, not
+`localhost`: `localhost` resolves `::1` first on most systems, and nothing
+listens on the IPv6 loopback, so it just hangs with no useful error). Print
+the vault's own key **on the vault** (not the age identity — that's for
+decrypting secrets, unrelated):
 
 ```bash
 cat ~/.ssh/id_ed25519.pub
@@ -87,7 +90,7 @@ sudoedit /etc/mineback/mineback.toml
 
 ```toml
 [hosts.drill-local]
-address = "ssh://root@localhost:19222"
+address = "ssh://root@127.0.0.1:19222"
 ```
 
 (`19222` is `tunnel.sh`'s default remote port — matches what it printed in

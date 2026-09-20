@@ -12,10 +12,13 @@
 # What it does: dials out from here to the vault and asks it to bind
 # 127.0.0.1:<remote-port> on ITSELF, forwarding anything that connects there
 # back through the tunnel to this machine's own sshd. The vault can then
-# reach this machine's Docker socket via `docker -H ssh://user@localhost:<remote-port>`
+# reach this machine's Docker socket via `docker -H ssh://user@127.0.0.1:<remote-port>`
 # as if it were any other directly-reachable host — from the vault's own
-# point of view, "localhost:<remote-port>" IS this machine, for the
-# lifetime of the tunnel.
+# point of view, "127.0.0.1:<remote-port>" IS this machine, for the
+# lifetime of the tunnel. Use 127.0.0.1 on the vault side, not "localhost" —
+# "localhost" resolves ::1 first on most systems, and nothing is listening
+# on the IPv6 loopback (the bind above is IPv4-only), so it just hangs/fails
+# with no useful error.
 set -euo pipefail
 
 VAULT_TARGET="${1:?usage: tunnel.sh <user@vault-host> [remote-port] [local-ssh-port]}"
@@ -35,7 +38,7 @@ Once connected, on the VAULT (${VAULT_TARGET#*@}), in another session, add
 (if not already present) to /etc/mineback/mineback.toml:
 
     [hosts.drill-local]
-    address = "ssh://root@localhost:${REMOTE_PORT}"
+    address = "ssh://root@127.0.0.1:${REMOTE_PORT}"
 
 then run, for whichever real host/server you want to rehearse a restore of:
 

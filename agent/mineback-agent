@@ -36,6 +36,14 @@ MINEBACK_RECIPIENTS_FILE="${MINEBACK_RECIPIENTS_FILE:-}"
 MINEBACK_SERVERS="${MINEBACK_SERVERS:-mc1 mc2 mc3 mc4 mc5}"
 MINEBACK_LOBBY="${MINEBACK_LOBBY:-lobby}"
 MINEBACK_PROXY="${MINEBACK_PROXY:-bungee}"
+# Literal "none" opts a host out of lobby/proxy entirely — for a host that
+# structurally never has one (e.g. a single standalone server), not just one
+# that's temporarily down. Without this, --fleet always marks itself
+# "partial" and exits non-zero on such a host, every run, forever: a down
+# container is a real gap worth flagging, but "this role doesn't exist here"
+# isn't. (Bash's ${VAR:-default} can't distinguish unset from an
+# admin-supplied empty string — both fall through to the default — so an
+# explicit sentinel is the only way to actually turn a role off.)
 MINEBACK_MHS_DIR="${MINEBACK_MHS_DIR:-}"
 MINEBACK_FLUSH_TIMEOUT="${MINEBACK_FLUSH_TIMEOUT:-60}"
 MINEBACK_STOP_TIMEOUT="${MINEBACK_STOP_TIMEOUT:-30}"
@@ -518,7 +526,9 @@ cmd_selftest() {
         check "vault reachable over ssh"   'ssh -o BatchMode=yes -o ConnectTimeout=5 ${MINEBACK_VAULT_SSH_KEY:+-i "$MINEBACK_VAULT_SSH_KEY"} "$host" -- true >/dev/null 2>&1; [ $? -ne 255 ]'
     fi
 
-    for s in $MINEBACK_SERVERS $MINEBACK_LOBBY; do
+    local selftest_targets="$MINEBACK_SERVERS"
+    [ "$MINEBACK_LOBBY" != "none" ] && selftest_targets="$selftest_targets $MINEBACK_LOBBY"
+    for s in $selftest_targets; do
         if container_running "$s"; then log "OK   $s is running"; else log "WARN $s is not running"; fi
     done
 
@@ -555,7 +565,11 @@ cmd_snapshot() {
     local method="hot"; [ $cold -eq 1 ] && method="cold"
 
     if [ $fleet -eq 1 ]; then
-        targets=($MINEBACK_LOBBY $MINEBACK_SERVERS)
+        if [ "$MINEBACK_LOBBY" = "none" ]; then
+            targets=($MINEBACK_SERVERS)
+        else
+            targets=($MINEBACK_LOBBY $MINEBACK_SERVERS)
+        fi
     fi
     [ ${#targets[@]} -eq 0 ] && targets=($MINEBACK_SERVERS)
 
@@ -599,17 +613,19 @@ cmd_snapshot() {
     done
 
     if [ $fleet -eq 1 ]; then
-        local presult
-        presult="$(snapshot_proxy "$MINEBACK_PROXY" "$reason" "$dry_run")"
-        case "$presult" in
-            SKIPPED) skipped=$((skipped+1)); printf '%-10s %-12s %-20s\n' "$MINEBACK_PROXY" "skipped" "-"
-                     add_server_json "$MINEBACK_PROXY" err "container not running" ;;
-            FAILED)  failed=$((failed+1));   printf '%-10s %-12s %-20s\n' "$MINEBACK_PROXY" "FAILED" "-"; EXIT_CODE=1
-                     add_server_json "$MINEBACK_PROXY" err "packing failed" ;;
-            DRYRUN)  printf '%-10s %-12s %-20s\n' "$MINEBACK_PROXY" "dry-run" "-" ;;
-            *)       ok=$((ok+1));           printf '%-10s %-12s %-20s\n' "$MINEBACK_PROXY" "ok" "$presult"
-                     add_server_json "$MINEBACK_PROXY" ok "$presult" ;;
-        esac
+        if [ "$MINEBACK_PROXY" != "none" ]; then
+            local presult
+            presult="$(snapshot_proxy "$MINEBACK_PROXY" "$reason" "$dry_run")"
+            case "$presult" in
+                SKIPPED) skipped=$((skipped+1)); printf '%-10s %-12s %-20s\n' "$MINEBACK_PROXY" "skipped" "-"
+                         add_server_json "$MINEBACK_PROXY" err "container not running" ;;
+                FAILED)  failed=$((failed+1));   printf '%-10s %-12s %-20s\n' "$MINEBACK_PROXY" "FAILED" "-"; EXIT_CODE=1
+                         add_server_json "$MINEBACK_PROXY" err "packing failed" ;;
+                DRYRUN)  printf '%-10s %-12s %-20s\n' "$MINEBACK_PROXY" "dry-run" "-" ;;
+                *)       ok=$((ok+1));           printf '%-10s %-12s %-20s\n' "$MINEBACK_PROXY" "ok" "$presult"
+                         add_server_json "$MINEBACK_PROXY" ok "$presult" ;;
+            esac
+        fi
 
         # The fleet snapshot id is generated here, unconditionally — hostconf
         # capture is one optional ingredient, not a gate on the fleet
@@ -626,9 +642,11 @@ cmd_snapshot() {
             if [ $failed -gt 0 ] || [ $skipped -gt 0 ]; then
                 status="partial"
             fi
+            local mode="bungeecord"
+            [ "$MINEBACK_PROXY" = "none" ] && mode="standalone"
             local fleet_manifest
-            fleet_manifest=$(printf '{"schema":1,"snapshot_id":"%s","host_id":"%s","reason":"%s","mhs_commit":"%s","mode":"bungeecord","status":"%s","artifacts":{%s},"servers":{%s}}' \
-                "$FLEET_SNAP" "$MINEBACK_HOST_ID" "$reason" "$HOSTCONF_MHS_COMMIT" "$status" "$HOSTCONF_ARTIFACTS_JSON" "$servers_json")
+            fleet_manifest=$(printf '{"schema":1,"snapshot_id":"%s","host_id":"%s","reason":"%s","mhs_commit":"%s","mode":"%s","status":"%s","artifacts":{%s},"servers":{%s}}' \
+                "$FLEET_SNAP" "$MINEBACK_HOST_ID" "$reason" "$HOSTCONF_MHS_COMMIT" "$mode" "$status" "$HOSTCONF_ARTIFACTS_JSON" "$servers_json")
             local fc
             fc="$(vault_call commit-fleet-manifest "$MINEBACK_HOST_ID" "$FLEET_SNAP" <<<"$fleet_manifest")"
             [ "$fc" = "OK" ] || { log "fleet manifest commit FAILED: $fc"; EXIT_CODE=1; }

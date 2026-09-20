@@ -69,11 +69,17 @@ MINEBACK_HOST_ID=cndrbrbr
 MINEBACK_VAULT=local
 MINEBACK_RECIPIENTS_FILE=/etc/mineback/recipients.age
 MINEBACK_SERVERS="mc1 mc2 mc3 mc4 mc5"
+MINEBACK_LOBBY=none
+MINEBACK_PROXY=none
 MINEBACK_MHS_DIR=/root/hostMC/minecraftHostingServer
 ```
 
-Delete/comment `MINEBACK_VAULT_SSH_KEY`, `MINEBACK_LOBBY`, `MINEBACK_PROXY` (standalone
-mode, no lobby/bungee here).
+Delete/comment `MINEBACK_VAULT_SSH_KEY` (standalone mode, no SSH transport here).
+`MINEBACK_LOBBY`/`MINEBACK_PROXY` need the literal value `none`, not deleting the
+line — an unset/empty value falls back to the defaults (`lobby`/`bungee`) rather
+than disabling the role, which makes `--fleet` mark itself `partial` and exit
+non-zero on every single run, forever, purely because those containers
+structurally don't exist here.
 
 **1.4 — Compat-view HTTP server.** `omasys-caddy` already owns host ports 80/443 on
 this box, and nginx's own stock `default` site also listens on 80 by default and
@@ -249,6 +255,8 @@ MINEBACK_VAULT=ssh://mc-backup@cndrbrbr.de:22
 MINEBACK_VAULT_SSH_KEY=/etc/mineback/agent_key
 MINEBACK_RECIPIENTS_FILE=/etc/mineback/recipients.age
 MINEBACK_SERVERS=javascriptminecraftworkshopserver-spigot-1
+MINEBACK_LOBBY=none
+MINEBACK_PROXY=none
 MINEBACK_MHS_DIR=/root/javascriptMinecraftWorkshopServer
 ```
 
@@ -258,12 +266,16 @@ MINEBACK_MHS_DIR=/root/javascriptMinecraftWorkshopServer
 `<project-dir-name>-spigot-1`. Check the real name with `docker ps` before assuming
 it matches the service name in the compose file.
 
-Leave `MINEBACK_LOBBY`/`MINEBACK_PROXY` at their defaults — there's no lobby/bungee
-container here, so `--fleet` will just report them as harmlessly "skipped" (fleet
-status `partial`, forever). Worth keeping `--fleet` anyway rather than switching
-the timer to plain `snapshot spigot`, since only the fleet path also captures
-`hostconf.zip` — the only way `.env` (the one real secret here, not in git) gets
-backed up at all.
+`MINEBACK_LOBBY`/`MINEBACK_PROXY` need the literal value `none`, not deleting the
+line or leaving it unset — an empty value still falls back to the defaults
+(`lobby`/`bungee`), and this host structurally never has either, so `--fleet`
+would otherwise mark itself `partial` and exit non-zero every single run,
+forever, for a "problem" that was never real (fixed in
+[the mineback-agent code itself](../agent/mineback-agent) after this was first
+found live on this exact host). Still keep `--fleet` rather than switching the
+timer to plain `snapshot javascriptminecraftworkshopserver-spigot-1`, since only
+the fleet path also captures `hostconf.zip` — the only way `.env` (the one real
+secret here, not in git) gets backed up at all.
 
 **3.4 — Seed `known_hosts` for the vault, on codefield.de** (same reason as 2.4 —
 `BatchMode=yes` means an unseeded host key fails outright, not interactively):
@@ -319,12 +331,11 @@ docker exec javascriptminecraftworkshopserver-spigot-1 bash -c 'apt-get update -
 Again a fix to the running container only, not the image — it won't survive a
 rebuild unless added to jsmcws's own Dockerfile.
 
-The fleet itself will always report `status: partial` and exit non-zero here —
-there's no `lobby`/`bungee` on this host, so those always show as "skipped" by
-design (see the `MINEBACK_LOBBY`/`MINEBACK_PROXY` note above). That's expected,
-not a regression to chase; check the *server* snapshot's own status
-(`mineback show codefield/javascriptminecraftworkshopserver-spigot-1`), not the
-fleet's.
+With `MINEBACK_LOBBY=none`/`MINEBACK_PROXY=none` set above, the fleet reports
+`status: complete` and exits `0` normally, same as any other host — it's no
+longer expected to look "partial" here. If it still does, check `mineback show
+codefield/<fleet-snapshot-id>` for what's actually failing (`hostconf` being
+unconfigured is the other thing that can cause it — see the O6 note earlier).
 
 No `BACKUP_URL`/nginx step here — jsmcws has no student self-service restore path
 to preserve (no `backup.sh`/`mc-restore.sh` equivalent), so there's no compat view

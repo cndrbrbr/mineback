@@ -69,12 +69,20 @@ MINEBACK_HOST_ID=mc-workshop-01
 MINEBACK_VAULT=local
 MINEBACK_RECIPIENTS_FILE=/etc/mineback/recipients.age
 MINEBACK_SERVERS="mc1 mc2 mc3 mc4 mc5"
+MINEBACK_LOBBY=none
+MINEBACK_PROXY=none
 MINEBACK_MHS_DIR=/root/hostMC/minecraftHostingServer
 ```
 
-Delete/comment out `MINEBACK_VAULT_SSH_KEY`, `MINEBACK_LOBBY`, `MINEBACK_PROXY` if
-you're running standalone mode (no lobby/bungee container) — they only apply to a
-BungeeCord-proxied fleet.
+Delete/comment out `MINEBACK_VAULT_SSH_KEY` if you're running standalone mode (no
+lobby/bungee container) — it's only needed for the SSH transport.
+
+`MINEBACK_LOBBY`/`MINEBACK_PROXY` need the literal value `none`, not just deleting
+or commenting the line out — an empty/unset value falls back to the defaults
+(`lobby`/`bungee`) rather than disabling the role, which makes `--fleet` mark
+itself `partial` and exit non-zero on *every single run, forever*, purely because
+those containers structurally don't exist here (not because anything is actually
+wrong). `none` is what actually turns the role off.
 
 ## 5. Enable the compat-view HTTP server
 

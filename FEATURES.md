@@ -26,7 +26,7 @@ Design rationale for all of this lives in [ARCHITECTURE.md](ARCHITECTURE.md).
 | B9 | **Explicit exclusions** — Spigot JARs, `bundler/`, `logs/`, `crash-reports/`, control flags | M1 | implemented | a 20 GB volume with a cached JAR produces a snapshot without it, and the server still starts after restore |
 | B10 | **Ad-hoc snapshot with a reason** — `--reason pre-version` / `workshop-final` | M1 | implemented | reason lands in the manifest and protects the snapshot from pruning |
 | B11 | **`enable-rcon` untouched** — console via `/proc/1/fd/0` as `announce.sh` does | M1 | implemented | no new listening port appears on any container |
-| B12 | **Standalone-mode support** — hosts without BungeeCord | M2 | planned | a `docker-compose.standalone.yml` host snapshots and restores identically |
+| B12 | **Standalone-mode support** — hosts without BungeeCord | M2 | implemented | a `docker-compose.standalone.yml` host (`MINEBACK_LOBBY=none MINEBACK_PROXY=none`) snapshots `complete` (not perpetually `partial`) and `mineback restore fleet` restores it identically — `restore_fleet` already iterates whatever the fleet manifest's `servers` map actually contains, with no hardcoded assumption of a proxy |
 | B13 | **Kind-aware packing** — `spigot` and `proxy` layouts, extensible for Paper/Velocity | M3 | planned | adding a kind needs a pack/restore descriptor, no change to transport or store |
 
 ## 2. Consistency
@@ -166,10 +166,20 @@ Velocity), optional full encryption.
 Essentially all of M1 is implemented and passes `tests/smoke-test.sh`,
 including a few items originally scoped for M2/M3 that turned out cheap once
 the core plumbing existed (cold snapshots, cross-host restore via `docker -H`,
-export, the install scripts, partial-fleet `--servers`). What's real but
-untested against production: R6/R7/R8 (marked `partial`) — the code paths are
-written and exercised against a fake Docker shim, but nobody has yet pointed
-them at an actual second hosting host or run the git-clone/`docker compose
-up` bootstrap of ARCHITECTURE.md §9.3 steps 1-3, which stays a manual step.
+export, the install scripts, partial-fleet `--servers`, B12 standalone-mode
+support). The backup path (single-server and fleet `snapshot`, secrets, push
+over both `local` and real SSH transport) has now been run against three
+independent production hosts — one colocated standalone fleet, one remote
+BungeeCord fleet, one remote non-MHS layout (`javascriptMinecraftWorkshopServer`)
+— which is what surfaced and fixed a real set of bugs the fake-Docker-shim
+smoke test structurally couldn't reach: `docker exec`'s invalid `-T` flag,
+`mc-backup`'s shell breaking every SSH forced command, `mineback-receive`
+reading its verb from argv instead of `$SSH_ORIGINAL_COMMAND`, a shared
+log file only one of two possible invokers could write to, and B12 itself.
+What's real but still untested against production: R6/R7/R8 (marked
+`partial`) — the *restore* code paths are written and exercised against a
+fake Docker shim, but nobody has yet run an actual restore against a real
+hosting host, or the git-clone/`docker compose up` bootstrap of
+ARCHITECTURE.md §9.3 steps 1-3, which stays a manual step.
 Genuinely not built: dedupe (T7), offsite replication (T9), pull mode (T10),
 metrics/alerting (O8-O10), key rotation (S5), and everything scoped to M3.

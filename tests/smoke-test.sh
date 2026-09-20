@@ -350,6 +350,37 @@ sys.exit(0 if m.get('status') == 'partial' else 1)
 "
 check "no hostconf.zip when MHS_DIR is unconfigured" bash -c "[ ! -f '$WORK/vault-home/store/h1/fleets/$FLEET2/hostconf.zip' ]"
 
+echo "== fleet snapshot on a host with no lobby/proxy (MINEBACK_LOBBY/PROXY=none) =="
+# Regression guard for the case found deploying to a third, single-server
+# host: without an explicit opt-out, a host that structurally never has a
+# lobby/proxy still gets marked "partial" (and exits non-zero) forever, on
+# every single run, purely because those roles are missing — indistinguishable
+# from a real down container. "none" should make it report complete instead.
+sed -e 's/^MINEBACK_LOBBY=.*/MINEBACK_LOBBY=none/' -e 's/^MINEBACK_PROXY=.*/MINEBACK_PROXY=none/' \
+    "$WORK/agent.env" > "$WORK/agent-noproxy.env"
+RC=0
+MINEBACK_AGENT_CONF="$WORK/agent-noproxy.env" mineback-agent snapshot --fleet --reason smoke-noproxy \
+    > "$WORK/out.log" 2>&1 || RC=$?
+check "exits zero (complete, not partial)" test "$RC" -eq 0
+check "no lobby/bungee rows attempted" bash -c "! grep -qE '^(lobby|bungee) ' '$WORK/out.log'"
+mineback vault reindex --quiet
+FLEET3=$(ls "$WORK/vault-home/store/h1/fleets" | sort | tail -1)
+check "fleet manifest status is complete" python3 -c "
+import json,sys
+m = json.load(open('$WORK/vault-home/store/h1/fleets/$FLEET3/manifest.json'))
+sys.exit(0 if m.get('status') == 'complete' else 1)
+"
+check "mode recorded as standalone" python3 -c "
+import json,sys
+m = json.load(open('$WORK/vault-home/store/h1/fleets/$FLEET3/manifest.json'))
+sys.exit(0 if m.get('mode') == 'standalone' else 1)
+"
+check "servers map has only mc1, no lobby/bungee" python3 -c "
+import json,sys
+m = json.load(open('$WORK/vault-home/store/h1/fleets/$FLEET3/manifest.json'))
+sys.exit(0 if set(m.get('servers',{})) == {'mc1'} else 1)
+"
+
 echo "== mineback-receive under a simulated SSH forced command =="
 # Regression guard for the real bug found deploying to a second host: over a
 # real SSH forced command (authorized_keys `command=...`), sshd never

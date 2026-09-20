@@ -192,6 +192,19 @@ mineback-agent snapshot --fleet --reason install-check
 
 Then back on the vault: `mineback ls --host meckminecraft`.
 
+If `bungee` specifically comes back `FAILED` while every `mcN`/`lobby` server
+succeeds, check for `zip`/`unzip` inside that container — `minecraftHostingServer`'s
+BungeeCord image doesn't ship them (its Spigot image does), so proxy config/plugin
+capture has nothing to run:
+
+```bash
+docker exec bungee which zip unzip || docker exec bungee bash -c 'apt-get update -qq && apt-get install -y -qq zip unzip'
+```
+
+That's a fix to the running container only — it won't survive a rebuild/recreate
+unless added to the image itself (a `minecraftHostingServer` change, not a
+`mineback` one).
+
 ## 3. codefield.de — single-server, non-MHS layout
 
 Same shape as step 2, once SSH is unblocked (step 0).

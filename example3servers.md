@@ -152,7 +152,17 @@ MINEBACK_PROXY=bungee
 MINEBACK_MHS_DIR=/root/minecraftHostingServer
 ```
 
-**2.4 — Authorize its push key on the vault.** Print the key on meckminecraft.de:
+**2.4 — Seed `known_hosts` for the vault, on meckminecraft.de.** Without this,
+`mineback-agent selftest`'s SSH reachability check (and every real push) fails with
+`Host key verification failed` — the agent's SSH calls use `BatchMode=yes`
+deliberately (so cron never hangs on a host-key prompt), which means an unknown
+host is refused outright rather than asked about interactively:
+
+```bash
+ssh-keyscan -H cndrbrbr.de >> /root/.ssh/known_hosts
+```
+
+**2.5 — Authorize its push key on the vault.** Print the key on meckminecraft.de:
 
 ```bash
 cat /etc/mineback/agent_key.pub
@@ -172,7 +182,7 @@ sudo chmod 700 /var/lib/mineback/.ssh
 sudo chmod 600 /var/lib/mineback/.ssh/authorized_keys
 ```
 
-**2.5 — Point its containers at the vault's HTTP view** — in
+**2.6 — Point its containers at the vault's HTTP view** — in
 `/root/minecraftHostingServer/docker-compose*.yml` on meckminecraft.de, each
 server's `BACKUP_URL` becomes:
 
@@ -183,7 +193,7 @@ BACKUP_URL: "http://cndrbrbr.de:8088/meckminecraft"
 then `docker compose up -d --no-deps mc1 mc2 mc3 mc4 mc5 lobby bungee`. (Make sure
 cndrbrbr.de's firewall allows inbound 8088 from meckminecraft.de.)
 
-**2.6 — Verify:**
+**2.7 — Verify:**
 
 ```bash
 mineback-agent selftest
@@ -241,10 +251,17 @@ the timer to plain `snapshot spigot`, since only the fleet path also captures
 `hostconf.zip` — the only way `.env` (the one real secret here, not in git) gets
 backed up at all.
 
-**3.4 — Authorize its push key on the vault**, same pattern as 2.4 but
+**3.4 — Seed `known_hosts` for the vault, on codefield.de** (same reason as 2.4 —
+`BatchMode=yes` means an unseeded host key fails outright, not interactively):
+
+```bash
+ssh-keyscan -H cndrbrbr.de >> /root/.ssh/known_hosts
+```
+
+**3.5 — Authorize its push key on the vault**, same pattern as 2.5 but
 `--fixed-host codefield`.
 
-**3.5 — Verify** — this is the case the [secrets.age
+**3.6 — Verify** — this is the case the [secrets.age
 fix](README.md) actually covers, worth watching closely the first time:
 
 ```bash

@@ -23,6 +23,14 @@ container name (`spigot`) — adjust the steps below if different.
 
 ## 1. cndrbrbr.de — finish the vault, add this host's own agent
 
+This assumes the repo lives at `/opt/mineback`, not under `/root`. That matters:
+`mineback-receive` runs as the unprivileged `mc-backup` account (via every agent's
+forced SSH command in steps 2.4/3.4), and `/root` is `700` by default — root-only —
+so a repo cloned there is unreachable to `mc-backup` no matter what
+`/usr/local/bin` symlinks point at. If yours is under `/root`, move it first
+(`sudo mv /root/mineback /opt/mineback`, then re-run `install-vault.sh`, which now
+checks for exactly this and warns if something's still blocking it).
+
 **1.1 — Add all three host blocks:**
 
 ```bash
@@ -46,7 +54,7 @@ mhs_dir = "/root/javascriptMinecraftWorkshopServer"   # adjust to the real path
 **1.2 — Install the agent here:**
 
 ```bash
-cd /root/mineback
+cd /opt/mineback
 sudo install/install-agent.sh
 ```
 
@@ -75,7 +83,7 @@ of the template's default 8080:
 ```bash
 sudo apt install nginx
 sudo rm -f /etc/nginx/sites-enabled/default
-sudo cp /root/mineback/etc/nginx/mineback-vault.conf /etc/nginx/sites-available/mineback-vault
+sudo cp /opt/mineback/etc/nginx/mineback-vault.conf /etc/nginx/sites-available/mineback-vault
 sudo sed -i 's/listen 8080;/listen 8088;/; s/listen \[::\]:8080;/listen [::]:8088;/' /etc/nginx/sites-available/mineback-vault
 sudo ln -s /etc/nginx/sites-available/mineback-vault /etc/nginx/sites-enabled/
 sudo nginx -t && sudo systemctl enable --now nginx
@@ -96,7 +104,7 @@ docker compose up -d --no-deps mc1 mc2 mc3 mc4 mc5
 **1.6 — Weekly auto-prune timer:**
 
 ```bash
-sudo cp /root/mineback/etc/systemd/mineback-vault-maintenance.{service,timer} /etc/systemd/system/
+sudo cp /opt/mineback/etc/systemd/mineback-vault-maintenance.{service,timer} /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now mineback-vault-maintenance.timer
 ```
@@ -150,12 +158,18 @@ MINEBACK_MHS_DIR=/root/minecraftHostingServer
 cat /etc/mineback/agent_key.pub
 ```
 
-Then, **on cndrbrbr.de**, append a restricted line to `mc-backup`'s authorized_keys
-(create `/var/lib/mineback/.ssh/authorized_keys` with `chmod 700 .ssh; chmod 600
-authorized_keys`, owned by `mc-backup`, if it doesn't exist yet):
+Then, **on cndrbrbr.de**, append a restricted line to `mc-backup`'s authorized_keys.
+The absolute path to `mineback-receive` is deliberate — a forced command's shell
+doesn't source any rc file, so `/usr/local/bin` isn't guaranteed to be on PATH
+(this is what `mineback host add <id>` itself now prints too):
 
 ```bash
-sudo -u mc-backup bash -c 'echo "command=\"mineback-receive --fixed-host meckminecraft\",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding <paste-the-pubkey-here>" >> ~/.ssh/authorized_keys'
+sudo mkdir -p /var/lib/mineback/.ssh
+echo 'command="/usr/local/bin/mineback-receive --fixed-host meckminecraft",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding <paste-the-pubkey-here>' \
+    | sudo tee -a /var/lib/mineback/.ssh/authorized_keys > /dev/null
+sudo chown -R mc-backup:mc-backup /var/lib/mineback/.ssh
+sudo chmod 700 /var/lib/mineback/.ssh
+sudo chmod 600 /var/lib/mineback/.ssh/authorized_keys
 ```
 
 **2.5 — Point its containers at the vault's HTTP view** — in

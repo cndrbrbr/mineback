@@ -507,7 +507,15 @@ cmd_selftest() {
         check "mineback-receive on PATH"   'command -v "$MINEBACK_RECEIVE_BIN" >/dev/null 2>&1'
     else
         local target="${MINEBACK_VAULT#ssh://}"; local host="${target%%:*}"
-        check "vault reachable over ssh"   'ssh -o BatchMode=yes -o ConnectTimeout=5 ${MINEBACK_VAULT_SSH_KEY:+-i "$MINEBACK_VAULT_SSH_KEY"} "$host" -- true'
+        # A restricted agent key's forced command (mineback-receive) always
+        # overrides whatever we ask it to run — `true` never actually
+        # executes remotely, so we can't just check for exit 0 (that would
+        # only ever pass against an unrestricted key). OpenSSH itself exits
+        # 255 specifically when the connection/auth step fails; any other
+        # exit code means the connection succeeded and the forced command
+        # ran (even a usage error from sending no real verb counts as
+        # "reachable" here).
+        check "vault reachable over ssh"   'ssh -o BatchMode=yes -o ConnectTimeout=5 ${MINEBACK_VAULT_SSH_KEY:+-i "$MINEBACK_VAULT_SSH_KEY"} "$host" -- true >/dev/null 2>&1; [ $? -ne 255 ]'
     fi
 
     for s in $MINEBACK_SERVERS $MINEBACK_LOBBY; do

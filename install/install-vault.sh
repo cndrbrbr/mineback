@@ -55,11 +55,18 @@ chmod 701 "$MINEBACK_HOME"
 chmod 700 "$MINEBACK_HOME/keys"
 
 echo "==> Creating mc-backup system user (owns the vault + receives agent pushes)..."
+# Needs a real shell, not /usr/sbin/nologin: every agent key is restricted by
+# a `command=` forced command in authorized_keys (T1/S2), and sshd runs that
+# forced command via the account's login shell (`<shell> -c "<command>"`).
+# nologin refuses to run anything at all, including the forced command
+# itself — it doesn't add security here (command= + no-pty already fully
+# override whatever the client asks for), it just breaks every push.
 if ! id mc-backup >/dev/null 2>&1; then
-    useradd --system --home-dir "$MINEBACK_HOME" --shell /usr/sbin/nologin mc-backup
+    useradd --system --home-dir "$MINEBACK_HOME" --shell /bin/bash mc-backup
     echo "    created"
 else
     echo "    already exists"
+    usermod -s /bin/bash mc-backup
 fi
 chown -R mc-backup:mc-backup "$MINEBACK_HOME"
 mkdir -p /home/mc-backup 2>/dev/null || true
@@ -71,6 +78,24 @@ ln -sf "$REPO/vault/mineback_lib" /usr/local/lib/mineback_lib 2>/dev/null || tru
 # mineback itself adds its own directory to sys.path, so the symlink above
 # is a convenience for other tools, not required for `mineback` to work.
 echo "    OK ($(command -v mineback))"
+
+# mc-backup (unprivileged) is who actually runs mineback-receive, via every
+# agent's forced SSH command — if the repo sits under a directory only root
+# can traverse (e.g. cloned into /root, which is 700 by default), that will
+# silently break every push with "Permission denied" the first time a real
+# agent connects, long after this script reports success. Catch it now.
+if ! sudo -u mc-backup test -x "$REPO/vault/mineback-receive" 2>/dev/null; then
+    echo ""
+    echo "    !!! WARNING: mc-backup cannot execute $REPO/vault/mineback-receive."
+    echo "    !!! Some ancestor directory of the repo (commonly /root itself)"
+    echo "    !!! isn't traversable by other users, so every agent's forced-"
+    echo "    !!! command push will fail once a restricted key is in place."
+    echo "    !!! Fix: move the repo somewhere world-traversable, e.g."
+    echo "    !!!   mv $REPO /opt/mineback   (then re-run this script)"
+    echo "    !!! or grant traversal-only access to the blocking directory:"
+    echo "    !!!   chmod o+x <that directory>"
+    echo ""
+fi
 
 echo "==> Generating the vault's age identity (if needed)..."
 mkdir -p /etc/mineback

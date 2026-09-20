@@ -137,7 +137,9 @@ def cmd_host_add(cfg, args):
     print("MINEBACK_RECIPIENTS_FILE=/etc/mineback/recipients.age")
     print()
     print("# On the vault, add a restricted key for that host's agent:")
-    print(f'  command="mineback-receive --fixed-host {args.host_id}",no-pty,no-port-forwarding,'
+    print("# (absolute path deliberately — a forced command's shell doesn't")
+    print("#  source any rc file, so /usr/local/bin isn't guaranteed on PATH)")
+    print(f'  command="/usr/local/bin/mineback-receive --fixed-host {args.host_id}",no-pty,no-port-forwarding,'
           f'no-agent-forwarding,no-X11-forwarding ssh-ed25519 AAAA... agent@{args.host_id}')
     print("  (append the agent's public key after generating it: ssh-keygen -t ed25519 -f agent_key -N '')")
 

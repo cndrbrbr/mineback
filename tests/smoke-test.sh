@@ -350,6 +350,26 @@ sys.exit(0 if m.get('status') == 'partial' else 1)
 "
 check "no hostconf.zip when MHS_DIR is unconfigured" bash -c "[ ! -f '$WORK/vault-home/store/h1/fleets/$FLEET2/hostconf.zip' ]"
 
+echo "== mineback-receive under a simulated SSH forced command =="
+# Regression guard for the real bug found deploying to a second host: over a
+# real SSH forced command (authorized_keys `command=...`), sshd never
+# appends the client's requested command to argv — the only place it shows
+# up is $SSH_ORIGINAL_COMMAND. Every path above runs mineback-receive
+# locally (MINEBACK_VAULT=local, direct argv), which never exercises this
+# and so never caught it. No real sshd needed to test it: set the env var
+# exactly as sshd would and call the script the same way authorized_keys'
+# `command=` does (fixed args only, real request nowhere in argv).
+RECV_TEST="$WORK/receive-test-home"
+mkdir -p "$RECV_TEST"
+OUT=$(echo -n "hello" | SSH_ORIGINAL_COMMAND="mineback-receive put rhost rserver 20260920T120000Z cfg.zip" \
+    MINEBACK_HOME="$RECV_TEST" "$REPO/vault/mineback-receive" --fixed-host rhost)
+check "put via \$SSH_ORIGINAL_COMMAND succeeds" bash -c "[[ '$OUT' == OK\ * ]]"
+check "artifact actually landed" test -f "$RECV_TEST/incoming/rhost/servers/rserver/20260920T120000Z/cfg.zip.tmp"
+
+SSH_ORIGINAL_COMMAND="mineback-receive put otherhost rserver 20260920T120000Z cfg.zip" \
+    MINEBACK_HOME="$RECV_TEST" "$REPO/vault/mineback-receive" --fixed-host rhost < /dev/null > "$WORK/out2.log" 2>&1 || true
+check "fixed-host scoping still enforced via \$SSH_ORIGINAL_COMMAND" contains "$WORK/out2.log" "does not match"
+
 echo "== GFS retention (pure logic, no filesystem) =="
 python3 -c "
 import sys

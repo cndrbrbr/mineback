@@ -60,6 +60,21 @@ if [ "${1:-}" = "--fixed-host" ]; then
 fi
 FIXED_HOST="${FIXED_HOST:-${MINEBACK_FIXED_HOST:-}}"
 
+# Under an SSH forced command (authorized_keys `command=...`), sshd runs
+# exactly that fixed string — it never appends what the client actually
+# asked to run to our argv. That request only ever reaches us via
+# $SSH_ORIGINAL_COMMAND (e.g. "mineback-receive put h s snap art"), set by
+# sshd itself. Without re-reading it here, every real call over SSH sees
+# nothing past --fixed-host and always looks like "no verb given". Split it
+# with plain IFS word-splitting, never eval — this string is entirely
+# client-controlled, and every token we pull out of it still goes through
+# the same *_RE validation below as any other path, so a hostile value just
+# fails validation rather than being interpreted as shell syntax.
+if [ -n "${SSH_ORIGINAL_COMMAND:-}" ]; then
+    read -ra _orig_args <<< "$SSH_ORIGINAL_COMMAND"
+    set -- "${_orig_args[@]:1}"   # drop the leading "mineback-receive"
+fi
+
 VERB="${1:-}"
 shift || true
 

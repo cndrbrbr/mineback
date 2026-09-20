@@ -146,7 +146,7 @@ container_running() {
 
 console() {
     # Send a console command the same way announce.sh does — no RCON port.
-    docker exec -T "$1" bash -c "echo '$2' > /proc/1/fd/0" 2>/dev/null
+    docker exec "$1" bash -c "echo '$2' > /proc/1/fd/0" 2>/dev/null
 }
 
 wait_for_flush() {
@@ -165,7 +165,7 @@ wait_for_started() {
     return 1
 }
 
-count_files() { docker exec -T "$1" bash -c "find '$2' -type f 2>/dev/null | wc -l" 2>/dev/null || echo 0; }
+count_files() { docker exec "$1" bash -c "find '$2' -type f 2>/dev/null | wc -l" 2>/dev/null || echo 0; }
 
 # ── quiesce a server, always undo it, even on failure ────────────────
 QUIESCE_ACTIVE=""
@@ -174,7 +174,7 @@ quiesce_start() {
     local c="$1" method="$2"
     QUIESCE_CONTAINER="$c"
     if [ "$method" = "cold" ]; then
-        docker exec -T "$c" touch /server/.stopped
+        docker exec "$c" touch /server/.stopped
         # The match pattern is passed as an env var, NOT embedded in the
         # `bash -c "..."` string: `pkill -f` scans every process's full
         # command line, including its own wrapping `bash -c` invocation —
@@ -182,10 +182,10 @@ quiesce_start() {
         # if it's written inline here, so pkill would match and kill its own
         # parent shell instead of (or as well as) the java process. An env
         # var is invisible to `-f` matching, so this sidesteps that entirely.
-        docker exec -T -e MB_PAT='spigot-.*\.jar' "$c" bash -c 'pkill -TERM -f "$MB_PAT" 2>/dev/null || true'
+        docker exec -e MB_PAT='spigot-.*\.jar' "$c" bash -c 'pkill -TERM -f "$MB_PAT" 2>/dev/null || true'
         local waited=0
         while [ "$waited" -lt "$MINEBACK_STOP_TIMEOUT" ]; do
-            docker exec -T -e MB_PAT='spigot-.*\.jar' "$c" bash -c 'pgrep -f "$MB_PAT" >/dev/null 2>&1' || break
+            docker exec -e MB_PAT='spigot-.*\.jar' "$c" bash -c 'pgrep -f "$MB_PAT" >/dev/null 2>&1' || break
             sleep 1; waited=$((waited+1))
         done
         QUIESCE_ACTIVE="cold"
@@ -204,7 +204,7 @@ quiesce_end() {
     [ -z "$QUIESCE_ACTIVE" ] && return 0
     case "$QUIESCE_ACTIVE" in
         cold)
-            docker exec -T "$QUIESCE_CONTAINER" rm -f /server/.stopped
+            docker exec "$QUIESCE_CONTAINER" rm -f /server/.stopped
             ;;
         hot-*)
             console "$QUIESCE_CONTAINER" "save-on"
@@ -232,14 +232,14 @@ pack_part_spigot() {
     case "$part" in
         cfg|plugins|worlds)
             entries="$(count_files "$c" "/server/data/$part")"
-            out="$(set -o pipefail; docker exec -T "$c" bash -c "cd /server/data && zip -qr - '$part'" \
+            out="$(set -o pipefail; docker exec "$c" bash -c "cd /server/data && zip -qr - '$part'" \
                 | send_artifact server "$MINEBACK_HOST_ID" "$server" "$snap" "$art")"
             rc=$?
             ;;
         state)
             # Loose files Spigot writes outside data/ — see ARCHITECTURE.md §2.
             local filelist
-            filelist="$(docker exec -T "$c" bash -c '
+            filelist="$(docker exec "$c" bash -c '
                 cd /server
                 for f in whitelist.json ops.json banned-players.json banned-ips.json \
                          usercache.json permissions.yml help.yml .version; do
@@ -247,7 +247,7 @@ pack_part_spigot() {
                 done')"
             [ -z "$filelist" ] && { log "no state files present on $c — skipping state.zip"; return 2; }
             entries="$(wc -l <<<"$filelist")"
-            out="$(set -o pipefail; docker exec -T "$c" bash -c "cd /server && zip -q - $(printf "%q " $filelist)" \
+            out="$(set -o pipefail; docker exec "$c" bash -c "cd /server && zip -q - $(printf "%q " $filelist)" \
                 | send_artifact server "$MINEBACK_HOST_ID" "$server" "$snap" "$art")"
             rc=$?
             ;;
@@ -260,7 +260,7 @@ pack_part_spigot() {
             # container doesn't) — check what's actually there instead of
             # assuming all four files exist, same pattern as the state part.
             local keyfiles
-            keyfiles="$(docker exec -T "$c" bash -c '
+            keyfiles="$(docker exec "$c" bash -c '
                 cd /server
                 for f in ssh_host_ed25519_key ssh_host_ed25519_key.pub ssh_host_rsa_key ssh_host_rsa_key.pub; do
                     [ -f "$f" ] && echo "$f"
@@ -268,7 +268,7 @@ pack_part_spigot() {
             [ -z "$keyfiles" ] && { log "no SSH host keys present on $c — skipping secrets.age"; return 2; }
             art="secrets.age"
             entries="$(wc -l <<<"$keyfiles")"
-            out="$(set -o pipefail; docker exec -T "$c" bash -c "cd /server && zip -q - $(printf "%q " $keyfiles)" \
+            out="$(set -o pipefail; docker exec "$c" bash -c "cd /server && zip -q - $(printf "%q " $keyfiles)" \
                 | age -R "$MINEBACK_RECIPIENTS_FILE" \
                 | send_artifact server "$MINEBACK_HOST_ID" "$server" "$snap" "$art")"
             rc=$?
@@ -306,9 +306,9 @@ snapshot_server() {
     fi
 
     local spigot_version level_name
-    spigot_version="$(docker exec -T "$server" bash -c 'cat /server/.version 2>/dev/null | tr -d "[:space:]"' )"
-    [ -z "$spigot_version" ] && spigot_version="$(docker exec -T "$server" bash -c 'echo ${SPIGOT_VERSION:-unknown}')"
-    level_name="$(docker exec -T "$server" bash -c 'echo ${MC_LEVELNAME:-world}')"
+    spigot_version="$(docker exec "$server" bash -c 'cat /server/.version 2>/dev/null | tr -d "[:space:]"' )"
+    [ -z "$spigot_version" ] && spigot_version="$(docker exec "$server" bash -c 'echo ${SPIGOT_VERSION:-unknown}')"
+    level_name="$(docker exec "$server" bash -c 'echo ${MC_LEVELNAME:-world}')"
 
     quiesce_start "$server" "$method"
 
@@ -398,10 +398,10 @@ snapshot_proxy() {
     fi
 
     local cfg_out plugins_out rc1 rc2
-    cfg_out="$(set -o pipefail; docker exec -T "$server" bash -c "cd /bungee && zip -q - config.yml modules.yml locations.yml 2>/dev/null" \
+    cfg_out="$(set -o pipefail; docker exec "$server" bash -c "cd /bungee && zip -q - config.yml modules.yml locations.yml 2>/dev/null" \
         | send_artifact server "$MINEBACK_HOST_ID" "$server" "$snap" "cfg.zip")"
     rc1=$?
-    plugins_out="$(set -o pipefail; docker exec -T "$server" bash -c "cd /bungee && zip -qr - plugins modules 2>/dev/null" \
+    plugins_out="$(set -o pipefail; docker exec "$server" bash -c "cd /bungee && zip -qr - plugins modules 2>/dev/null" \
         | send_artifact server "$MINEBACK_HOST_ID" "$server" "$snap" "plugins.zip")"
     rc2=$?
 

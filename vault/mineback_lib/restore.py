@@ -126,17 +126,17 @@ def take_safety_snapshot(cfg: Config, target_host: str, target_server: str) -> s
 
 
 def _quiesce_stop(env: dict, container: str, timeout: int = 30) -> None:
-    _run(["docker", "exec", "-T", container, "bash", "-c", "touch /server/.stopped"], env=env)
+    _run(["docker", "exec", container, "bash", "-c", "touch /server/.stopped"], env=env)
     # Pattern goes through an env var, not the `bash -c` string itself: `-f`
     # matches every process's full command line, including this wrapping
     # shell's own — which would otherwise contain the pattern text verbatim
     # and get killed along with (or instead of) the actual java process. See
     # the matching comment in agent/mineback-agent's quiesce_start().
-    _run(["docker", "exec", "-T", "-e", "MB_PAT=spigot-.*\\.jar", container, "bash", "-c",
+    _run(["docker", "exec", "-e", "MB_PAT=spigot-.*\\.jar", container, "bash", "-c",
           'pkill -TERM -f "$MB_PAT" 2>/dev/null || true'], env=env)
     waited = 0
     while waited < timeout:
-        r = _run(["docker", "exec", "-T", "-e", "MB_PAT=spigot-.*\\.jar", container, "bash", "-c",
+        r = _run(["docker", "exec", "-e", "MB_PAT=spigot-.*\\.jar", container, "bash", "-c",
                    'pgrep -f "$MB_PAT" >/dev/null 2>&1'], env=env, check=False)
         if r.returncode != 0:
             break
@@ -147,7 +147,7 @@ def _quiesce_stop(env: dict, container: str, timeout: int = 30) -> None:
 def _resume(env: dict, container: str) -> None:
     # Removing .stopped is enough — entrypoint.sh's own loop, already running
     # inside the container, notices and relaunches java. No separate "start".
-    _run(["docker", "exec", "-T", container, "bash", "-c", "rm -f /server/.stopped"], env=env, check=False)
+    _run(["docker", "exec", container, "bash", "-c", "rm -f /server/.stopped"], env=env, check=False)
 
 
 def _wait_started(env: dict, container: str, timeout: int = 180) -> bool:
@@ -176,7 +176,7 @@ def _extract_part(
             "ssh_host_rsa_key ssh_host_rsa_key.pub && "
             "chmod 600 ssh_host_ed25519_key ssh_host_rsa_key"
         )
-        _run(["docker", "exec", "-T", container, "bash", "-c", script], env=env)
+        _run(["docker", "exec", container, "bash", "-c", script], env=env)
         return
 
     remote_tmp = f"/tmp/restore-{part}.zip"
@@ -201,7 +201,7 @@ def _extract_part(
             f"rm -rf /server/data/{part} && mkdir -p /server/data && "
             f"unzip -qo {remote_tmp} -d /server/data && rm -f {remote_tmp}"
         )
-    _run(["docker", "exec", "-T", container, "bash", "-c", script], env=env)
+    _run(["docker", "exec", container, "bash", "-c", script], env=env)
 
 
 def _log_restore(cfg: Config, plan: RestorePlan, safety: str | None, started: bool) -> None:
@@ -272,7 +272,7 @@ def restore_server(
                     continue
                 _extract_part(env, container, part, plan.snapshot.artifact_path(art), age_identity, kind)
             if any(p in parts for p in ("cfg", "plugins", "worlds", "state")):
-                _run(["docker", "exec", "-T", container, "bash", "-c",
+                _run(["docker", "exec", container, "bash", "-c",
                       "chown -R mc-sftp:mc-sftp /server/data"], env=env, check=False)
         finally:
             _resume(env, container)

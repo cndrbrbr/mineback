@@ -65,8 +65,15 @@ case "$sub" in
     name=""; declare -a envs=()
     while [ $# -gt 0 ]; do
       case "$1" in
-        -T|-i|-it) shift ;;
+        # Regression guard: real `docker exec` has no -T (that's a
+        # docker-compose-exec-only flag; plain `docker exec` just never
+        # allocates a tty unless you pass -t) — a caller sending -T would
+        # break for real, silently pass here. Only accept flags real
+        # `docker exec` actually has.
+        -T) echo "FAKE DOCKER: -T is not a real 'docker exec' flag" >&2; exit 97 ;;
+        -i|-it|-d|--privileged) shift ;;
         -e) envs+=("$2"); shift 2 ;;
+        -u|-w) shift 2 ;;
         *) name="$1"; shift; break ;;
       esac
     done

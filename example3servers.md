@@ -248,9 +248,15 @@ MINEBACK_HOST_ID=codefield
 MINEBACK_VAULT=ssh://mc-backup@cndrbrbr.de:22
 MINEBACK_VAULT_SSH_KEY=/etc/mineback/agent_key
 MINEBACK_RECIPIENTS_FILE=/etc/mineback/recipients.age
-MINEBACK_SERVERS=spigot
+MINEBACK_SERVERS=javascriptminecraftworkshopserver-spigot-1
 MINEBACK_MHS_DIR=/root/javascriptMinecraftWorkshopServer
 ```
+
+`MINEBACK_SERVERS` is *not* just `spigot` — unlike `minecraftHostingServer` (which sets
+`container_name: mc1` etc. explicitly), jsmcws's `docker-compose.yml` has no
+`container_name:` for the `spigot` service, so Compose auto-names it
+`<project-dir-name>-spigot-1`. Check the real name with `docker ps` before assuming
+it matches the service name in the compose file.
 
 Leave `MINEBACK_LOBBY`/`MINEBACK_PROXY` at their defaults — there's no lobby/bungee
 container here, so `--fleet` will just report them as harmlessly "skipped" (fleet
@@ -301,6 +307,24 @@ mineback-agent snapshot --fleet --reason install-check
 Confirm `cfg.zip`/`plugins.zip`/`worlds.zip`/`state.zip` land and there's no
 `secrets.age` (correctly absent — no sshd in that container) and the run still
 reports `ok`, not `FAILED`.
+
+If it fails with `zip: command not found` instead, jsmcws's `spigot` image doesn't
+ship `zip`/`unzip` either (same gap as `bungee`'s image in step 2.7) — install into
+the running container the same way:
+
+```bash
+docker exec javascriptminecraftworkshopserver-spigot-1 bash -c 'apt-get update -qq && apt-get install -y -qq zip unzip'
+```
+
+Again a fix to the running container only, not the image — it won't survive a
+rebuild unless added to jsmcws's own Dockerfile.
+
+The fleet itself will always report `status: partial` and exit non-zero here —
+there's no `lobby`/`bungee` on this host, so those always show as "skipped" by
+design (see the `MINEBACK_LOBBY`/`MINEBACK_PROXY` note above). That's expected,
+not a regression to chase; check the *server* snapshot's own status
+(`mineback show codefield/javascriptminecraftworkshopserver-spigot-1`), not the
+fleet's.
 
 No `BACKUP_URL`/nginx step here — jsmcws has no student self-service restore path
 to preserve (no `backup.sh`/`mc-restore.sh` equivalent), so there's no compat view

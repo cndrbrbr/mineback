@@ -44,7 +44,19 @@ FIXED_HOST=""
 
 log() {
     mkdir -p "$LOGDIR" 2>/dev/null
-    printf '%s\tpid=%s\t%s\n' "$(date -u +%FT%TZ)" "$$" "$*" >> "$LOGDIR/receive.log" 2>/dev/null
+    # A colocated vault (local-mode agent, runs as root) and a remote agent's
+    # forced command (runs as mc-backup) share this one log file — whichever
+    # writes first otherwise owns it exclusively (600), locking the other
+    # out. umask 000 in the subshell means whoever creates it first leaves
+    # it world-writable, so either side can always append afterward; a log
+    # line is host/server/snapshot/hash metadata, nothing sensitive, so that
+    # trade-off is fine here. The whole thing is wrapped so a permission
+    # failure (e.g. an already-existing file from before this fix) can't
+    # print to the caller's stderr: redirections run left-to-right, so
+    # putting `2>/dev/null` after `>>` on one line does NOT catch a failure
+    # to open that same `>>` target — this failed silently in appearance
+    # only, not in fact, before being wrapped like this.
+    ( umask 000; printf '%s\tpid=%s\t%s\n' "$(date -u +%FT%TZ)" "$$" "$*" >> "$LOGDIR/receive.log" ) 2>/dev/null
 }
 
 fail() {

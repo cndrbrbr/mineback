@@ -266,8 +266,29 @@ backed up at all.
 ssh-keyscan -H cndrbrbr.de >> /root/.ssh/known_hosts
 ```
 
-**3.5 — Authorize its push key on the vault**, same pattern as 2.5 but
-`--fixed-host codefield`.
+**3.5 — Authorize its push key on the vault.** Print the key on codefield.de:
+
+```bash
+cat /etc/mineback/agent_key.pub
+```
+
+Then, **on cndrbrbr.de**, append a restricted line to `mc-backup`'s authorized_keys
+— *append*, not replace: meckminecraft.de's line from step 2.5 needs to stay too.
+Only `--fixed-host codefield` and the pasted-in key differ from that step; that's
+what pins this key to only ever push snapshots under the `codefield` host-id (S3:
+a compromised host can only write its own name, never impersonate another):
+
+```bash
+sudo mkdir -p /var/lib/mineback/.ssh
+echo 'command="/usr/local/bin/mineback-receive --fixed-host codefield",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding <paste-the-pubkey-here>' \
+    | sudo tee -a /var/lib/mineback/.ssh/authorized_keys > /dev/null
+sudo chown -R mc-backup:mc-backup /var/lib/mineback/.ssh
+sudo chmod 700 /var/lib/mineback/.ssh
+sudo chmod 600 /var/lib/mineback/.ssh/authorized_keys
+```
+
+The `mkdir`/`chown`/`chmod` lines are harmless to re-run even though the directory
+already exists from meckminecraft.de's setup.
 
 **3.6 — Verify** — this is the case the [secrets.age
 fix](README.md) actually covers, worth watching closely the first time:

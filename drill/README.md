@@ -87,8 +87,15 @@ sudoedit /etc/mineback/mineback.toml
 
 ```toml
 [hosts.drill-local]
-address = "ssh://root@localhost:2222"
+address = "ssh://root@localhost:19222"
 ```
+
+(`19222` is `tunnel.sh`'s default remote port — matches what it printed in
+step 2. If that's already taken on the vault, e.g. by another service or a
+previous drill, pass a different one as its second argument: `./drill/tunnel.sh
+root@cndrbrbr.de 19223`, and use that port here instead. Check with `ss -ltn`
+on the vault first if unsure — a colocated vault/hosting-host in particular
+already has a lot of ports in use.)
 
 ## 4. Run the drill
 

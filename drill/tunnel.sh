@@ -19,7 +19,13 @@
 set -euo pipefail
 
 VAULT_TARGET="${1:?usage: tunnel.sh <user@vault-host> [remote-port] [local-ssh-port]}"
-REMOTE_PORT="${2:-2222}"
+# 19222, not something like 2222: minecraftHostingServer maps each student's
+# SSH/FileZilla port at 222N (2221=mc1, 2222=mc2, ...), so a "nice round"
+# port in that range is exactly the one most likely to already be taken on
+# the vault if it's also a colocated hosting host (it was, the first time
+# this was tried). Check the vault's actual open ports (`ss -ltn`) before
+# assuming any port is free, this default included.
+REMOTE_PORT="${2:-19222}"
 LOCAL_SSH_PORT="${3:-22}"
 
 cat <<EOF

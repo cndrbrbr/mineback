@@ -67,11 +67,16 @@ MINEBACK_MHS_DIR=/root/hostMC/minecraftHostingServer
 Delete/comment `MINEBACK_VAULT_SSH_KEY`, `MINEBACK_LOBBY`, `MINEBACK_PROXY` (standalone
 mode, no lobby/bungee here).
 
-**1.4 — Compat-view HTTP server:**
+**1.4 — Compat-view HTTP server.** `omasys-caddy` already owns host ports 80/443 on
+this box, and nginx's own stock `default` site also listens on 80 by default and
+will fail to bind alongside it — remove that site and put mineback on 8088 instead
+of the template's default 8080:
 
 ```bash
 sudo apt install nginx
+sudo rm -f /etc/nginx/sites-enabled/default
 sudo cp /root/mineback/etc/nginx/mineback-vault.conf /etc/nginx/sites-available/mineback-vault
+sudo sed -i 's/listen 8080;/listen 8088;/; s/listen \[::\]:8080;/listen [::]:8088;/' /etc/nginx/sites-available/mineback-vault
 sudo ln -s /etc/nginx/sites-available/mineback-vault /etc/nginx/sites-enabled/
 sudo nginx -t && sudo systemctl enable --now nginx
 ```
@@ -80,7 +85,7 @@ sudo nginx -t && sudo systemctl enable --now nginx
 every `BACKUP_URL: ""` line becomes:
 
 ```yaml
-BACKUP_URL: "http://localhost:8080/cndrbrbr"
+BACKUP_URL: "http://localhost:8088/cndrbrbr"
 ```
 
 ```bash
@@ -158,11 +163,11 @@ sudo -u mc-backup bash -c 'echo "command=\"mineback-receive --fixed-host meckmin
 server's `BACKUP_URL` becomes:
 
 ```yaml
-BACKUP_URL: "http://cndrbrbr.de:8080/meckminecraft"
+BACKUP_URL: "http://cndrbrbr.de:8088/meckminecraft"
 ```
 
 then `docker compose up -d --no-deps mc1 mc2 mc3 mc4 mc5 lobby bungee`. (Make sure
-cndrbrbr.de's firewall allows inbound 8080 from meckminecraft.de.)
+cndrbrbr.de's firewall allows inbound 8088 from meckminecraft.de.)
 
 **2.6 — Verify:**
 

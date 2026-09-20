@@ -45,7 +45,14 @@ echo "    OK"
 
 echo "==> Creating $MINEBACK_HOME ..."
 mkdir -p "$MINEBACK_HOME"/{store,incoming,public,logs,keys/authorized_keys.d}
-chmod 700 "$MINEBACK_HOME" "$MINEBACK_HOME/keys"
+# o+x (not o+r) on the home dir itself: lets nginx (www-data) traverse down
+# into public/ to serve the compat view, per README's nginx step, without
+# making the home directory's own contents listable or readable by others —
+# store/, incoming/ and keys/ stay unreachable regardless (keys/ is 700 on
+# top of that; store/incoming are only reachable by name from inside the
+# tree, which nginx's root never points at).
+chmod 701 "$MINEBACK_HOME"
+chmod 700 "$MINEBACK_HOME/keys"
 
 echo "==> Creating mc-backup system user (owns the vault + receives agent pushes)..."
 if ! id mc-backup >/dev/null 2>&1; then

@@ -255,9 +255,20 @@ pack_part_spigot() {
             [ -z "$MINEBACK_RECIPIENTS_FILE" ] && { log "MINEBACK_RECIPIENTS_FILE not set — skipping secrets.age"; return 2; }
             [ -f "$MINEBACK_RECIPIENTS_FILE" ] || { log "recipients file not found: $MINEBACK_RECIPIENTS_FILE"; return 2; }
             command -v age >/dev/null 2>&1 || { log "age binary not found on agent host — skipping secrets.age"; return 2; }
+            # SSH host keys are an MHS-container convention, not every server
+            # image runs sshd (e.g. javascriptMinecraftWorkshopServer's spigot
+            # container doesn't) — check what's actually there instead of
+            # assuming all four files exist, same pattern as the state part.
+            local keyfiles
+            keyfiles="$(docker exec -T "$c" bash -c '
+                cd /server
+                for f in ssh_host_ed25519_key ssh_host_ed25519_key.pub ssh_host_rsa_key ssh_host_rsa_key.pub; do
+                    [ -f "$f" ] && echo "$f"
+                done')"
+            [ -z "$keyfiles" ] && { log "no SSH host keys present on $c — skipping secrets.age"; return 2; }
             art="secrets.age"
-            entries=4
-            out="$(set -o pipefail; docker exec -T "$c" bash -c "cd /server && zip -q - ssh_host_ed25519_key ssh_host_ed25519_key.pub ssh_host_rsa_key ssh_host_rsa_key.pub" \
+            entries="$(wc -l <<<"$keyfiles")"
+            out="$(set -o pipefail; docker exec -T "$c" bash -c "cd /server && zip -q - $(printf "%q " $keyfiles)" \
                 | age -R "$MINEBACK_RECIPIENTS_FILE" \
                 | send_artifact server "$MINEBACK_HOST_ID" "$server" "$snap" "$art")"
             rc=$?

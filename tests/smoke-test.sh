@@ -197,6 +197,30 @@ check "secrets.age is actually encrypted (age can't decrypt without identity)" \
 check "secrets.age decrypts with the identity" \
     bash -c "age -d -i '$WORK/identity.txt' '$STOREDIR/secrets.age' >/dev/null 2>&1"
 
+echo "== single-server snapshot on a host with no sshd (e.g. javascriptMinecraftWorkshopServer) =="
+mk_spigot_nossh() {
+    local root="$1"
+    mkdir -p "$root/data/cfg" "$root/data/plugins" "$root/data/worlds/world/region"
+    echo "server-name=x" > "$root/data/cfg/server.properties"
+    echo "plugin" > "$root/data/plugins/x.jar"
+    echo "world" > "$root/data/worlds/world/level.dat"
+    echo "region" > "$root/data/worlds/world/region/r.0.0.mca"
+    echo '[{"uuid":"abc","name":"Alice"}]' > "$root/whitelist.json"
+    # deliberately no ssh_host_* files — this is the case that used to fail
+    # the whole snapshot (agent/mineback-agent's secrets part had no
+    # existence check, unlike state's)
+}
+mk_spigot_nossh "$WORK/fakeroot/mc-nossh/server"
+mineback-agent snapshot mc-nossh --reason smoke-nossh > "$WORK/out.log" 2>&1
+check "snapshot with no SSH host keys still COMPLETEs" grep -q "COMPLETE" "$WORK/out.log"
+check "not reported as FAILED" not_contains "$WORK/out.log" "FAILED"
+mineback vault reindex --quiet
+SNAP_NOSSH=$(mineback ls --host h1 --server mc-nossh | awk 'NR==2{print $3}')
+NOSSH_DIR="$WORK/vault-home/store/h1/servers/mc-nossh/$SNAP_NOSSH"
+check "cfg.zip still captured" test -f "$NOSSH_DIR/cfg.zip"
+check "worlds.zip still captured" test -f "$NOSSH_DIR/worlds.zip"
+check "secrets.age correctly absent (nothing to encrypt)" bash -c "[ ! -e '$NOSSH_DIR/secrets.age' ]"
+
 echo "== vault verify (scrub) =="
 mineback vault verify > "$WORK/out.log" 2>&1
 check "scrub clean on an untouched store" grep -q "0 issue" "$WORK/out.log"

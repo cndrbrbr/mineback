@@ -65,7 +65,7 @@ Design rationale for all of this lives in [ARCHITECTURE.md](ARCHITECTURE.md).
 | R3 | **Selective parts** — `--parts worlds,plugins,cfg,state,secrets` | M1 | implemented | `--parts worlds` reverts the map and leaves plugin changes intact |
 | R4 | **Snapshot selection** — `latest`, snapshot id, a date, `--before <ts>` | M1 | implemented | all four forms resolve, and an ambiguous date lists candidates instead of guessing |
 | R5 | **Safety snapshot before restore** — skippable with `--no-safety` | M1 | implemented | a wrong restore is undone by restoring the auto-created `pre-restore` snapshot |
-| R6 | **Cross-slot / cross-host restore** — `--to h2/mc1` | M2 | partial | an `mc3` snapshot comes up as `mc1` on another host with correct `level-name` and paths |
+| R6 | **Cross-slot / cross-host restore** — `--to h2/mc1` | M2 | implemented | verified for real: `mineback drill cndrbrbr/mc1 --to drill-local/mc1-drill` (a genuinely separate machine, real `docker -H ssh://`, real world/plugin/state/secrets data) restored and came up clean — the mechanism needs no special "level-name"/path rewriting, since every container's own `/server` is already host- and slot-agnostic by construction, `target_server` just names which container to extract into |
 | R7 | **Full host restore** — `mineback restore fleet` | M1 | partial | a bare host plus vault plus MHS git yields a working stack with all worlds, whitelists and fingerprints |
 | R8 | **Restore into a fresh stack** — provision compose, decrypt secrets, scaffold volumes, then fill | M1 | partial | performed on a machine that has never run MHS |
 | R9 | **Post-restore health gate** — wait for `Done (…)!`, verify expected worlds | M1 | implemented | a server that fails to start makes the restore command exit non-zero with the log tail |
@@ -176,10 +176,15 @@ smoke test structurally couldn't reach: `docker exec`'s invalid `-T` flag,
 `mc-backup`'s shell breaking every SSH forced command, `mineback-receive`
 reading its verb from argv instead of `$SSH_ORIGINAL_COMMAND`, a shared
 log file only one of two possible invokers could write to, and B12 itself.
-What's real but still untested against production: R6/R7/R8 (marked
-`partial`) — the *restore* code paths are written and exercised against a
-fake Docker shim, but nobody has yet run an actual restore against a real
-hosting host, or the git-clone/`docker compose up` bootstrap of
-ARCHITECTURE.md §9.3 steps 1-3, which stays a manual step.
+*Restore* was the other structurally-untestable-via-fake-shim gap; a real
+drill (see [drill/README.md](drill/README.md) — a disposable local machine,
+no production host touched) confirmed R2/R6/R9/V2 for real: extracting a
+real snapshot (worlds, plugins, cfg, state, secrets) over a genuine
+cross-host `docker -H ssh://` connection, resuming the container, and
+seeing it come back up and log `Done (...)!`. What's still untested against
+production: R7/R8 (marked `partial`) — restoring a whole *fleet*, and the
+git-clone/`docker compose up` bootstrap of ARCHITECTURE.md §9.3 steps 1-3
+that provisions a fresh stack from nothing, both stay unexercised outside
+the fake Docker shim.
 Genuinely not built: dedupe (T7), offsite replication (T9), pull mode (T10),
 metrics/alerting (O8-O10), key rotation (S5), and everything scoped to M3.

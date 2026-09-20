@@ -15,9 +15,13 @@ configs of every server deployed with
 > only thing that's been exercised: real SSH transport, real Docker, and real
 > world data all landed real bugs the shim structurally couldn't reach — see
 > [FEATURES.md](FEATURES.md)'s "Current implementation status" for exactly
-> what those were. Restore itself (R6/R7/R8) is the one area still unproven
-> against a real host — see [drill/README.md](drill/README.md) to rehearse
-> one safely. [ARCHITECTURE.md](ARCHITECTURE.md) has the full design.
+> what those were. A real restore drill (see [drill/README.md](drill/README.md)
+> — a disposable local machine, no production host touched) has since
+> confirmed single-server restore works for real too, including across a
+> genuine `docker -H ssh://` connection to a different host. Whole-*fleet*
+> restore and bootstrapping a fresh stack from nothing (R7/R8) remain the
+> one area still unproven against production. [ARCHITECTURE.md](ARCHITECTURE.md)
+> has the full design.
 
 ---
 

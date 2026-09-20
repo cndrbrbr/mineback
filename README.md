@@ -189,8 +189,39 @@ mineback metrics
 (all already in the MHS image/host), plus the `age` binary for encrypting secrets.
 
 **Vault** — Linux, Python 3.11+ (standard library only, no pip install), `zip`/`unzip`,
-`age`, `ssh`, Docker (for the HTTP view and restore drills), and disk of roughly
-*(size of all worlds) × (retained snapshots, before dedupe)*.
+`age`, `ssh`, `sqlite3`, Docker (for the HTTP view and restore drills), and disk of
+roughly *(size of all worlds) × (retained snapshots, before dedupe)*.
+
+## Prerequisites
+
+`install-vault.sh` and `install-agent.sh` each check for their own tools and refuse
+to run if anything is missing, but it's faster to install everything up front. On
+Debian/Ubuntu:
+
+```bash
+# on the vault
+sudo apt install python3 zip unzip age ssh sqlite3 docker.io docker-compose-plugin
+
+# on each hosting host (docker/ssh/zip/curl already ship with the MHS image)
+sudo apt install age
+```
+
+| Tool | Needed by | What for |
+|------|-----------|----------|
+| `python3` (3.11+) | vault | the `mineback` CLI — `tomllib` needs 3.11+ |
+| `sqlite3` | vault | the catalog database (`catalog.sqlite`) |
+| `zip` / `unzip` | vault + hosting host | packing/unpacking snapshot artifacts |
+| `age` | vault + hosting host | encrypting/decrypting `secrets.age` / `hostconf-secrets.age` |
+| `ssh` | vault + hosting host | agent push, admin-driven restore (not needed for a colocated setup — see [example-setup.md](example-setup.md)) |
+| `curl` | hosting host | student self-service `restore latest` |
+| `docker` + compose | vault + hosting host | `docker exec` quiesce, restore drills, restarting servers |
+| nginx (or equivalent) | vault | serving `public/` for the compat-view HTTP restore |
+
+`age` on Debian is packaged from trixie onward; on older releases, install the
+[upstream release](https://github.com/FiloSottile/age/releases) binary instead.
+
+A full walkthrough of installing both pieces on one machine is in
+[example-setup.md](example-setup.md).
 
 ## Related projects
 
@@ -203,6 +234,7 @@ mineback metrics
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — components, data model, flows, security, design decisions
 - [FEATURES.md](FEATURES.md) — feature catalogue with milestones and acceptance criteria
+- [example-setup.md](example-setup.md) — worked example: installing vault + agent colocated on one host
 
 ## License
 

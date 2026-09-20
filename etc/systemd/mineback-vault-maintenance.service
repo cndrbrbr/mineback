@@ -1,11 +1,10 @@
 [Unit]
-Description=mineback vault maintenance — scrub, gc, prune (dry-run)
+Description=mineback vault maintenance — scrub, gc, prune (auto-delete)
 
 [Service]
 Type=oneshot
-# `prune` is intentionally run WITHOUT --yes here: this unit reports what
-# pruning would do (L4) and leaves actually deleting anything to a human
-# running `mineback vault prune --yes`, or to a second, explicitly-opted-in
-# timer if you decide nightly auto-prune is what you want.
+# Auto-prune is opted into deliberately: keep_last=1 in mineback.toml means
+# only the newest snapshot per server is meant to survive, so this unit
+# actually deletes what GFS retention marks prunable every week.
 ExecStart=/usr/local/bin/mineback vault verify --gc
-ExecStart=/usr/local/bin/mineback vault prune
+ExecStart=/usr/local/bin/mineback vault prune --yes

@@ -139,7 +139,11 @@ a *different*, restricted key.
 scp /etc/mineback/recipients.age root@meckminecraft.de:/etc/mineback/recipients.age
 ```
 
-**2.3 — On meckminecraft.de, configure `/etc/mineback/agent.env`:**
+**2.3 — On meckminecraft.de, configure `agent.env`:**
+
+```bash
+sudoedit /etc/mineback/agent.env
+```
 
 ```bash
 MINEBACK_HOST_ID=meckminecraft
@@ -233,7 +237,11 @@ sudo install/install-agent.sh
 scp /etc/mineback/recipients.age root@codefield.de:/etc/mineback/recipients.age
 ```
 
-**3.3 — `agent.env` on codefield.de:**
+**3.3 — On codefield.de, configure `agent.env`:**
+
+```bash
+sudoedit /etc/mineback/agent.env
+```
 
 ```bash
 MINEBACK_HOST_ID=codefield
